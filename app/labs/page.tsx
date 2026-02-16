@@ -18,12 +18,7 @@ export default function LabsPage() {
   const [userEmail, setUserEmail] = useState<string>("");
 
   // base URL configured via Vercel environment variable
-  const API_BASE = process.env.NEXT_PUBLIC_API_URL;
-  if (!API_BASE) {
-    throw new Error(
-      "NEXT_PUBLIC_API_URL is not set. Please configure it in Vercel."
-    );
-  }
+  const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
   useEffect(() => {
     const token = localStorage.getItem("sessionToken");
@@ -43,7 +38,12 @@ export default function LabsPage() {
     try {
       const userId = localStorage.getItem("userId") || "demo-user";
       const purchaseId = localStorage.getItem("purchaseId") || `purchase-${Date.now()}`;
-      // use configured base url for backend
+      // ensure we have a base url from environment
+      if (!API_BASE) {
+        throw new Error(
+          "NEXT_PUBLIC_API_URL is not set. Please configure it in Vercel."
+        );
+      }
       const backendUrl = API_BASE;
 
       console.log("[v0] Starting lab:", { labId, userId, backendUrl });
