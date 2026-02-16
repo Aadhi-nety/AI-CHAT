@@ -163,14 +163,17 @@ app.post("/api/labs/session/:sessionId/end", async (req, res) => {
 wsApp.ws("/terminal/:sessionId", (ws, req) => {
   const { sessionId } = req.params;
 
-  console.log(`[Terminal] New connection: ${sessionId}`);
+  console.log(`[Terminal] New connection attempt: ${sessionId}`);
 
   const session = labSessionService.getSession(sessionId);
 
   if (!session) {
+    console.error(`[Terminal] Session lookup failed for ${sessionId}. Closing connection with 4000 Invalid session.`);
     ws.close(4000, "Invalid session");
     return;
   }
+
+  console.log(`[Terminal] Session found for ${sessionId}, creating terminal instance.`);
 
   // Create terminal instance for this connection
   const terminalInstance = terminalServer.createTerminal(sessionId, {

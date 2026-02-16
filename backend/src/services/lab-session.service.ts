@@ -72,7 +72,7 @@ export class LabSessionService {
       // Set expiry timer
       this.setSessionExpiry(sessionId);
 
-      console.log(`[LabSession] Session created: ${sessionId}`);
+      console.log(`[LabSession] Session created: ${sessionId}, expiresAt: ${new Date(expiresAt).toISOString()}, now: ${new Date(startedAt).toISOString()}`);
       return session;
     } catch (error) {
       console.error("[LabSession] Failed to create session:", error);
@@ -85,16 +85,25 @@ export class LabSessionService {
    */
   getSession(sessionId: string): LabSession | undefined {
     const session = this.activeSessions.get(sessionId);
+    const now = Date.now();
 
-    if (session && session.status === "active") {
-      if (Date.now() > session.expiresAt) {
-        session.status = "expired";
-        return undefined;
-      }
-      return session;
+    if (!session) {
+      console.warn(`[LabSession] Session not found: ${sessionId}. Active sessions: ${Array.from(this.activeSessions.keys()).join(", ")}`);
+      return undefined;
     }
 
-    return undefined;
+    if (session.status !== "active") {
+      console.warn(`[LabSession] Session ${sessionId} is not active (status: ${session.status})`);
+      return undefined;
+    }
+
+    if (now > session.expiresAt) {
+      console.warn(`[LabSession] Session ${sessionId} has expired. Now: ${now}, ExpiresAt: ${session.expiresAt}`);
+      session.status = "expired";
+      return undefined;
+    }
+
+    return session;
   }
 
   /**
