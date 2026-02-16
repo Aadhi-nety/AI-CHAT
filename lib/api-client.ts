@@ -1,4 +1,5 @@
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:3001";
+// API Base URL for production - set via environment variable in Vercel
+const API_BASE = process.env.NEXT_PUBLIC_API_URL;
 
 export interface LabStartResponse {
   success: boolean;
@@ -46,7 +47,20 @@ class APIClient {
   private baseUrl: string;
 
   constructor() {
-    this.baseUrl = BACKEND_URL;
+    this.baseUrl = API_BASE || "";
+  }
+
+  /**
+   * Ensure that the base URL has been configured before making requests.
+   * Throws a clear error that can be surfaced in production if the
+   * environment variable was not set properly (e.g. on Vercel).
+   */
+  private ensureBaseUrl() {
+    if (!this.baseUrl) {
+      throw new Error(
+        "API base URL is not configured. Please set NEXT_PUBLIC_API_URL in Vercel."
+      );
+    }
   }
 
   /**
@@ -58,6 +72,8 @@ class APIClient {
     purchaseId: string,
     token: string
   ): Promise<LabStartResponse> {
+    this.ensureBaseUrl();
+
     try {
       const response = await fetch(`${this.baseUrl}/api/labs/start`, {
         method: "POST",
@@ -88,6 +104,8 @@ class APIClient {
    * Get session details
    */
   async getSession(sessionId: string): Promise<LabSession> {
+    this.ensureBaseUrl();
+
     try {
       const response = await fetch(
         `${this.baseUrl}/api/labs/session/${sessionId}`,
@@ -118,6 +136,8 @@ class APIClient {
     sessionId: string,
     minutes: number = 30
   ): Promise<{ newExpiresAt: number }> {
+    this.ensureBaseUrl();
+
     try {
       const response = await fetch(
         `${this.baseUrl}/api/labs/session/${sessionId}/extend`,
@@ -146,6 +166,8 @@ class APIClient {
    * End a lab session
    */
   async endSession(sessionId: string): Promise<{ success: boolean }> {
+    this.ensureBaseUrl();
+
     try {
       const response = await fetch(
         `${this.baseUrl}/api/labs/session/${sessionId}/end`,
@@ -173,6 +195,8 @@ class APIClient {
    * Get WebSocket URL for terminal
    */
   getTerminalUrl(sessionId: string): string {
+    this.ensureBaseUrl();
+
     const protocol = this.baseUrl.startsWith("https") ? "wss" : "ws";
     const url = this.baseUrl.replace("https://", "").replace("http://", "");
     return `${protocol}://${url}/terminal/${sessionId}`;

@@ -1,21 +1,14 @@
-# WebSocket Stability Fixes
+# Production Deployment Changes - TODO
 
-## Completed Tasks
-- [x] Added server-side ping/pong keepalive (15s interval)
-- [x] Added ping handling in server message handler
-- [x] Improved error handling and logging in server
-- [x] Reduced client ping interval to 10 seconds
-- [x] Increased max reconnection attempts to 5
-- [x] Reduced initial reconnect delay to 2 seconds
-- [x] Added client handling for server-initiated pings
-- [x] Fixed useEffect dependency issue in use-terminal.ts (removed connect from deps)
-- [x] Tested WebSocket connection stability - PASSED
-- [x] Verified connection remains stable for 30+ seconds
-- [x] Confirmed no abnormal disconnections (code 1006)
+## Tasks:
+- [x] 1. Update backend/src/server.ts - Add proper CORS configuration for Vercel
+- [ ] 2. Update lib/api-client.ts - Replace BACKEND_URL with API_BASE
+- [ ] 3. Update app/labs/page.tsx - Use API_BASE instead of inline backendUrl
 
-## Test Results
-- ✅ WebSocket connection established successfully
-- ✅ Bidirectional ping/pong keepalive working
-- ✅ Connection remained stable for full test duration
-- ✅ No disconnection errors observed
-- ✅ Clean connection close on test completion
+## Environment Variables to Set:
+
+### Vercel (Frontend):
+- `NEXT_PUBLIC_API_URL` = https://2rrfaahu3d.ap-south-1.awsapprunner.com
+
+### AWS App Runner (Backend):
+- Already configured to use process.env.PORT

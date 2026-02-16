@@ -17,6 +17,14 @@ export default function LabsPage() {
   const [sessionToken, setSessionToken] = useState<string>("");
   const [userEmail, setUserEmail] = useState<string>("");
 
+  // base URL configured via Vercel environment variable
+  const API_BASE = process.env.NEXT_PUBLIC_API_URL;
+  if (!API_BASE) {
+    throw new Error(
+      "NEXT_PUBLIC_API_URL is not set. Please configure it in Vercel."
+    );
+  }
+
   useEffect(() => {
     const token = localStorage.getItem("sessionToken");
     const email = localStorage.getItem("userId");
@@ -35,7 +43,8 @@ export default function LabsPage() {
     try {
       const userId = localStorage.getItem("userId") || "demo-user";
       const purchaseId = localStorage.getItem("purchaseId") || `purchase-${Date.now()}`;
-      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:3001";
+      // use configured base url for backend
+      const backendUrl = API_BASE;
 
       console.log("[v0] Starting lab:", { labId, userId, backendUrl });
 
@@ -71,7 +80,9 @@ export default function LabsPage() {
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "Failed to start lab";
       console.error("[v0] Error starting lab:", errorMsg);
-      setError(`${errorMsg}. Make sure backend is running at http://localhost:3001`);
+      setError(
+        `${errorMsg}. Make sure NEXT_PUBLIC_API_URL is configured correctly.`
+      );
       setStartingLab(null);
     }
   };

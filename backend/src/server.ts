@@ -1,7 +1,8 @@
-import express from "express";
+import express, { Request } from "express";
 import expressWs from "express-ws";
 import cors from "cors";
 import dotenv from "dotenv";
+import { WebSocket } from "ws";
 import labSessionService from "./services/lab-session.service";
 import { TerminalServer } from "./terminal-server";
 
@@ -10,8 +11,15 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
-app.use(cors());
+// CORS configuration for production - allow only Vercel frontend
+const corsOptions = {
+  origin: ["https://ai-chat-two-ecru.vercel.app"],
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // Initialize express-ws
