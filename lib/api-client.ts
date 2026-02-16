@@ -1,5 +1,10 @@
 // API Base URL for production - set via environment variable in Vercel
-const API_BASE = process.env.NEXT_PUBLIC_API_URL;
+// trim whitespace just in case the value was entered with extra space
+let API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+if (API_BASE && API_BASE.trim() !== API_BASE) {
+  console.warn("NEXT_PUBLIC_API_URL contains extra whitespace, trimming");
+  API_BASE = API_BASE.trim();
+}
 
 export interface LabStartResponse {
   success: boolean;

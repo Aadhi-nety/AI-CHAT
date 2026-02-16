@@ -42,6 +42,32 @@ export class AWSControlTowerService {
    * Create a new sandbox AWS account
    */
   async createSandboxAccount(userId: string, labId: string): Promise<SandboxAccount> {
+    // if AWS credentials are missing we either are running in local/dev or the service
+    // hasn't been configured properly.  In production we want to fail fast with a
+    // clear error; for local development we'll return a mock account so that the
+    // rest of the flow can be exercised without calling AWS.
+    if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+      if (process.env.NODE_ENV === "production") {
+        console.error("[AWSControlTower] AWS credentials are not configured");
+        throw new Error("AWS credentials not configured on backend");
+      } else {
+        console.warn("[AWSControlTower] AWS credentials missing, using mock sandbox (dev mode)");
+        // return a minimal fake account so UI still works
+        return {
+          accountId: "000000000000",
+          accountName: `lab-${labId}-${userId}-dev`,
+          email: "dev@sandbox.local",
+          iamUserId: "dev-user",
+          iamUserName: "dev-user",
+          iamAccessKeyId: "DEVKEY",
+          iamSecretAccessKey: "DEVSECRET",
+          createdAt: Date.now(),
+          expiresAt: Date.now() + 2 * 60 * 60 * 1000,
+          status: "active",
+        };
+      }
+    }
+
     try {
       // Generate unique account name
       const accountName = `lab-${labId}-${userId}-${uuidv4().slice(0, 8)}`;

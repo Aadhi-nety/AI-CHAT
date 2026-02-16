@@ -18,7 +18,12 @@ export default function LabsPage() {
   const [userEmail, setUserEmail] = useState<string>("");
 
   // base URL configured via Vercel environment variable
-  const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+  // read and trim; environment values sometimes include stray spaces
+  let API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+  if (API_BASE && API_BASE.trim() !== API_BASE) {
+    console.warn("LabsPage: NEXT_PUBLIC_API_URL contains whitespace, trimming");
+    API_BASE = API_BASE.trim();
+  }
 
   useEffect(() => {
     const token = localStorage.getItem("sessionToken");
@@ -78,11 +83,19 @@ export default function LabsPage() {
       console.log("[v0] Lab started successfully:", data.session.sessionId);
       window.location.href = `/labs/${labId}`;
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : "Failed to start lab";
+      let errorMsg = err instanceof Error ? err.message : "Failed to start lab";
       console.error("[v0] Error starting lab:", errorMsg);
-      setError(
-        `${errorMsg}. Make sure NEXT_PUBLIC_API_URL is configured correctly.`
-      );
+
+      // if the backend indicates credential misconfiguration, show a clearer notice
+      if (errorMsg.toLowerCase().includes("aws credentials")) {
+        setError(
+          "Backend AWS credentials are not configured. Please check the server environment or contact the administrator."
+        );
+      } else {
+        setError(
+          `${errorMsg}. Make sure NEXT_PUBLIC_API_URL is configured correctly.`
+        );
+      }
       setStartingLab(null);
     }
   };
