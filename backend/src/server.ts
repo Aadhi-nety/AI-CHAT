@@ -15,6 +15,7 @@ const PORT = process.env.PORT || 3001;
 const allowedOrigins: string[] = [
   "https://ai-chat-two-ecru.vercel.app",
   "https://ai-chat-eor90dxjd-aadhi-netys-projects.vercel.app",
+  "https://ai-chat-op8a1ytr0-aadhi-netys-projects.vercel.app",
   process.env.FRONTEND_URL,
   "http://localhost:3000",
   "http://localhost:3001"
