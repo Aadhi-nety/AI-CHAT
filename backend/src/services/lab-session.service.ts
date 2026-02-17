@@ -9,6 +9,7 @@ export interface LabSession {
   purchaseId: string;
   sandboxAccount: SandboxAccount;
   startedAt: number;
+  createdAt: number;
   expiresAt: number;
   status: "active" | "expired" | "destroyed";
   terminalPort: number;
@@ -63,6 +64,7 @@ export class LabSessionService {
         purchaseId,
         sandboxAccount,
         startedAt,
+        createdAt: Date.now(),
         expiresAt,
         status: "active",
         terminalPort: 3100 + Math.floor(Math.random() * 900),
@@ -87,11 +89,12 @@ export class LabSessionService {
   }
 
   /**
-   * Get active session
+   * Get active session with grace period for newly created sessions
    */
   getSession(sessionId: string): LabSession | undefined {
     const session = this.activeSessions.get(sessionId);
     const now = Date.now();
+    const GRACE_PERIOD_MS = 10000; // 10 second grace period for session initialization
 
     if (!session) {
       console.warn(`[LabSession] Session not found: ${sessionId}. Active sessions: ${this.getActiveSessionIds().join(", ") || "none"}`);
@@ -99,8 +102,11 @@ export class LabSessionService {
       return undefined;
     }
 
-    if (session.status !== "active") {
-      console.warn(`[LabSession] Session ${sessionId} is not active (status: ${session.status}, created: ${new Date(session.startedAt).toISOString()})`);
+    // Allow sessions in grace period even if status is not yet "active"
+    const isInGracePeriod = session.createdAt && (now - session.createdAt) < GRACE_PERIOD_MS;
+    
+    if (session.status !== "active" && !isInGracePeriod) {
+      console.warn(`[LabSession] Session ${sessionId} is not active (status: ${session.status}, created: ${new Date(session.startedAt).toISOString()}, gracePeriod: ${isInGracePeriod})`);
       return undefined;
     }
 
@@ -110,7 +116,13 @@ export class LabSessionService {
       return undefined;
     }
 
-    console.log(`[LabSession] Session ${sessionId} validated successfully. Lab: ${session.labId}, expires in ${Math.floor((session.expiresAt - now) / 1000)}s`);
+    // Auto-activate sessions in grace period
+    if (isInGracePeriod && session.status !== "active") {
+      console.log(`[LabSession] Auto-activating session ${sessionId} (in grace period)`);
+      session.status = "active";
+    }
+
+    console.log(`[LabSession] Session ${sessionId} validated successfully. Lab: ${session.labId}, expires in ${Math.floor((session.expiresAt - now) / 1000)}s, age: ${now - session.createdAt}ms`);
     return session;
   }
 

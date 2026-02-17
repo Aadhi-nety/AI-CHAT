@@ -48,6 +48,9 @@ const { app: wsApp } = expressWs(app);
 // Initialize terminal server
 const terminalServer = new TerminalServer();
 
+// Helper function for delay
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 // Health check
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: Date.now() });
@@ -177,7 +180,7 @@ app.post("/api/labs/session/:sessionId/end", async (req, res) => {
  * WebSocket /terminal/:sessionId
  * Terminal connection for executing commands
  */
-wsApp.ws("/terminal/:sessionId", (ws, req) => {
+wsApp.ws("/terminal/:sessionId", async (ws, req) => {
   const { sessionId } = req.params;
   const startTime = Date.now();
   const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
@@ -187,12 +190,37 @@ wsApp.ws("/terminal/:sessionId", (ws, req) => {
   console.log(`[Terminal] Client IP: ${clientIp}, Origin: ${origin}`);
   console.log(`[Terminal] Request headers:`, JSON.stringify(req.headers, null, 2));
 
-  const session = labSessionService.getSession(sessionId);
+  // Retry session lookup with exponential backoff
+  let session = labSessionService.getSession(sessionId);
+  let retryCount = 0;
+  const maxRetries = 3;
+  
+  while (!session && retryCount < maxRetries) {
+    retryCount++;
+    const backoffMs = Math.min(100 * Math.pow(2, retryCount - 1), 1000); // Max 1 second
+    console.log(`[Terminal] Session not found, retrying in ${backoffMs}ms (attempt ${retryCount}/${maxRetries})`);
+    await delay(backoffMs);
+    session = labSessionService.getSession(sessionId);
+  }
 
   if (!session) {
-    const errorMsg = `[Terminal] Session lookup failed for ${sessionId}. Active sessions: ${labSessionService.getActiveSessionIds?.() || 'N/A'}`;
+    const errorMsg = `[Terminal] Session lookup failed for ${sessionId} after ${retryCount} retries. Active sessions: ${labSessionService.getActiveSessionIds?.().join(", ") || 'N/A'}`;
     console.error(errorMsg);
     console.error(`[Terminal] Connection attempt took ${Date.now() - startTime}ms`);
+    
+    // Send detailed error to client before closing
+    try {
+      ws.send(JSON.stringify({
+        type: "error",
+        message: "Session not found or expired",
+        code: "SESSION_NOT_FOUND",
+        sessionId: sessionId,
+        timestamp: Date.now()
+      }));
+    } catch (e) {
+      // Client may have already disconnected
+    }
+    
     ws.close(4000, "Invalid session");
     return;
   }
@@ -307,4 +335,38 @@ app.get("/api/diagnostics/websocket", (req, res) => {
     timestamp: Date.now(),
     activeSessions: labSessionService.getActiveSessionIds?.() || "N/A"
   });
+});
+
+/**
+ * GET /api/labs/session/:sessionId/validate
+ * Validate session without establishing WebSocket connection
+ */
+app.get("/api/labs/session/:sessionId/validate", (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const session = labSessionService.getSession(sessionId);
+
+    if (!session) {
+      return res.status(404).json({
+        valid: false,
+        error: "Session not found or expired",
+        sessionId
+      });
+    }
+
+    res.json({
+      valid: true,
+      sessionId: session.sessionId,
+      labId: session.labId,
+      status: session.status,
+      expiresAt: session.expiresAt,
+      expiresIn: Math.floor((session.expiresAt - Date.now()) / 1000)
+    });
+  } catch (error) {
+    console.error("[API] Error validating session:", error);
+    res.status(500).json({ 
+      valid: false,
+      error: "Failed to validate session" 
+    });
+  }
 });

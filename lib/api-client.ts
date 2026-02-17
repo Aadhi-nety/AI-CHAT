@@ -197,14 +197,58 @@ class APIClient {
   }
 
   /**
+   * Validate session without establishing WebSocket connection
+   */
+  async validateSession(sessionId: string): Promise<boolean> {
+    this.ensureBaseUrl();
+
+    try {
+      const response = await fetch(
+        `${this.baseUrl}/api/labs/session/${sessionId}/validate`,
+        {
+          method: "GET",
+          headers: {
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      if (!response.ok) {
+        console.warn(`[APIClient] Session validation failed: ${response.status}`);
+        return false;
+      }
+
+      const data = await response.json();
+      return data.valid === true;
+    } catch (error) {
+      console.error("[APIClient] Error validating session:", error);
+      return false;
+    }
+  }
+
+  /**
    * Get WebSocket URL for terminal
    */
   getTerminalUrl(sessionId: string): string {
     this.ensureBaseUrl();
 
+    // Validate sessionId format
+    if (!sessionId || typeof sessionId !== 'string') {
+      throw new Error("Invalid sessionId: must be a non-empty string");
+    }
+
     const protocol = this.baseUrl.startsWith("https") ? "wss" : "ws";
     const url = this.baseUrl.replace("https://", "").replace("http://", "");
-    return `${protocol}://${url}/terminal/${sessionId}`;
+    const wsUrl = `${protocol}://${url}/terminal/${sessionId}`;
+    
+    // Validate URL format
+    try {
+      new URL(wsUrl);
+    } catch (e) {
+      throw new Error(`Invalid WebSocket URL generated: ${wsUrl}`);
+    }
+    
+    return wsUrl;
   }
 }
 

@@ -8,6 +8,8 @@ interface UseTerminalOptions {
   onError?: (error: Error) => void;
   onConnect?: () => void;
   onDisconnect?: () => void;
+  sessionId?: string;
+  validateSession?: (sessionId: string) => Promise<boolean>;
 }
 
 interface ConnectionDiagnostics {
@@ -29,6 +31,7 @@ export function useTerminal(
     url: webSocketUrl,
     attempts: 0,
   });
+  const [isValidating, setIsValidating] = useState(false);
   const messageQueueRef = useRef<TerminalCommand[]>([]);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const reconnectAttemptsRef = useRef(0);
@@ -40,8 +43,37 @@ export function useTerminal(
 
   const memoizedOptions = useMemo(() => options, [options.onConnect, options.onMessage, options.onError, options.onDisconnect]);
 
-  const connect = useCallback(() => {
-    if (!webSocketUrl || isConnecting || ws.current?.readyState === WebSocket.CONNECTING) return;
+  const connect = useCallback(async () => {
+    if (!webSocketUrl || isConnecting || isValidating || ws.current?.readyState === WebSocket.CONNECTING) return;
+
+    // Validate session before connecting if validation function provided
+    if (options.sessionId && options.validateSession) {
+      setIsValidating(true);
+      try {
+        console.log(`[Terminal] Validating session ${options.sessionId} before connecting...`);
+        const isValid = await options.validateSession(options.sessionId);
+        if (!isValid) {
+          const error = new Error("Session validation failed. The session may have expired or been destroyed.");
+          console.error("[Terminal] Session validation failed");
+          setError(error);
+          setIsConnecting(false);
+          setIsValidating(false);
+          memoizedOptions.onError?.(error);
+          return;
+        }
+        console.log("[Terminal] Session validation successful");
+      } catch (err) {
+        console.warn("[Terminal] Session validation error:", err);
+        // Continue anyway - let WebSocket connection handle it
+      } finally {
+        setIsValidating(false);
+      }
+    }
+
+    // Add small delay to ensure session is registered on server
+    if (reconnectAttemptsRef.current === 0) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
 
     setIsConnecting(true);
     setError(null);
@@ -149,8 +181,26 @@ export function useTerminal(
 
         memoizedOptions.onDisconnect?.();
 
+        // Handle specific error codes
+        const isInvalidSession = event.code === 4000;
+        const isServerError = event.code >= 4500;
+        
+        if (isInvalidSession) {
+          console.error("[Terminal] Invalid session - will not retry");
+          const errorMessage = "Session is invalid or has expired. Please start a new lab session.";
+          const error = new Error(errorMessage);
+          setError(error);
+          setDiagnostics(prev => ({
+            ...prev,
+            attempts: reconnectAttemptsRef.current,
+            lastError: errorMessage,
+          }));
+          memoizedOptions.onError?.(error);
+          return; // Don't retry on invalid session
+        }
+
         // Attempt to reconnect if not a normal closure and under max attempts
-        if (event.code !== 1000 && reconnectAttemptsRef.current < maxReconnectAttempts) {
+        if (event.code !== 1000 && !isServerError && reconnectAttemptsRef.current < maxReconnectAttempts) {
           reconnectAttemptsRef.current++;
           // Exponential backoff: base delay * 2^(attempt - 1)
           const backoffDelay = reconnectDelay * Math.pow(2, reconnectAttemptsRef.current - 1);
@@ -163,9 +213,11 @@ export function useTerminal(
           reconnectTimeoutRef.current = setTimeout(() => {
             connect();
           }, backoffDelay);
-        } else if (reconnectAttemptsRef.current >= maxReconnectAttempts) {
-          console.error("[Terminal] Max reconnection attempts reached");
-          const errorMessage = `Failed to connect after ${maxReconnectAttempts} attempts. Last close code: ${event.code}. Please refresh the page or contact support.`;
+        } else if (reconnectAttemptsRef.current >= maxReconnectAttempts || isServerError) {
+          console.error("[Terminal] Max reconnection attempts reached or server error");
+          const errorMessage = isServerError 
+            ? `Server error (code: ${event.code}). Please try again later.`
+            : `Failed to connect after ${maxReconnectAttempts} attempts. Last close code: ${event.code}. Please refresh the page or contact support.`;
           const error = new Error(errorMessage);
           setError(error);
           setDiagnostics(prev => ({
@@ -252,9 +304,14 @@ export function useTerminal(
   return {
     isConnected,
     isConnecting,
+    isValidating,
     error,
     executeCommand,
     resizeTerminal,
     diagnostics,
+    reconnect: () => {
+      reconnectAttemptsRef.current = 0;
+      connect();
+    },
   };
 }
