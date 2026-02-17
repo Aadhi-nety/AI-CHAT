@@ -10,6 +10,13 @@ interface UseTerminalOptions {
   onDisconnect?: () => void;
 }
 
+interface ConnectionDiagnostics {
+  url: string;
+  attempts: number;
+  lastError?: string;
+  connectionTime?: number;
+}
+
 export function useTerminal(
   webSocketUrl: string,
   options: UseTerminalOptions = {}
@@ -18,6 +25,10 @@ export function useTerminal(
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const [diagnostics, setDiagnostics] = useState<ConnectionDiagnostics>({
+    url: webSocketUrl,
+    attempts: 0,
+  });
   const messageQueueRef = useRef<TerminalCommand[]>([]);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const reconnectAttemptsRef = useRef(0);
@@ -25,6 +36,7 @@ export function useTerminal(
   const reconnectDelay = 2000; // 2 seconds
   const pingInterval = 10000; // 10 seconds
   const pingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const connectionStartTimeRef = useRef<number>(0);
 
   const memoizedOptions = useMemo(() => options, [options.onConnect, options.onMessage, options.onError, options.onDisconnect]);
 
@@ -33,15 +45,25 @@ export function useTerminal(
 
     setIsConnecting(true);
     setError(null);
+    connectionStartTimeRef.current = Date.now();
+
+    console.log(`[Terminal] Connecting to ${webSocketUrl} (attempt ${reconnectAttemptsRef.current + 1}/${maxReconnectAttempts})`);
 
     try {
       ws.current = new WebSocket(webSocketUrl);
 
       ws.current.onopen = () => {
-        console.log("[Terminal] Connected");
+        const connectionTime = Date.now() - connectionStartTimeRef.current;
+        console.log(`[Terminal] Connected in ${connectionTime}ms`);
         setIsConnected(true);
         setIsConnecting(false);
         reconnectAttemptsRef.current = 0;
+        setDiagnostics(prev => ({
+          ...prev,
+          attempts: 0,
+          connectionTime,
+          lastError: undefined,
+        }));
 
         // Start ping/pong keepalive
         pingIntervalRef.current = setInterval(() => {
@@ -89,9 +111,26 @@ export function useTerminal(
         console.error("[Terminal] WebSocket error:", event);
         setIsConnected(false);
         setIsConnecting(false);
+        
+        // Determine specific error message
+        let errorMessage = "WebSocket connection failed";
+        if (reconnectAttemptsRef.current >= maxReconnectAttempts) {
+          errorMessage = "Failed to connect after maximum attempts. Please check your network connection and try again.";
+        } else if (!navigator.onLine) {
+          errorMessage = "You appear to be offline. Please check your internet connection.";
+        } else if (webSocketUrl.startsWith("wss://") && window.location.protocol === "http:") {
+          errorMessage = "Mixed content error: Cannot connect to secure WebSocket from HTTP page.";
+        }
+        
+        setDiagnostics(prev => ({
+          ...prev,
+          attempts: reconnectAttemptsRef.current,
+          lastError: errorMessage,
+        }));
+        
         // Only call onError if we're not already in a reconnect attempt
         if (reconnectAttemptsRef.current === 0) {
-          const error = new Error("WebSocket connection failed");
+          const error = new Error(errorMessage);
           setError(error);
           memoizedOptions.onError?.(error);
         }
@@ -116,13 +155,24 @@ export function useTerminal(
           // Exponential backoff: base delay * 2^(attempt - 1)
           const backoffDelay = reconnectDelay * Math.pow(2, reconnectAttemptsRef.current - 1);
           console.log(`[Terminal] Reconnecting in ${backoffDelay}ms (attempt ${reconnectAttemptsRef.current}/${maxReconnectAttempts})`);
+          setDiagnostics(prev => ({
+            ...prev,
+            attempts: reconnectAttemptsRef.current,
+            lastError: `Connection closed (code: ${event.code}). Retrying...`,
+          }));
           reconnectTimeoutRef.current = setTimeout(() => {
             connect();
           }, backoffDelay);
         } else if (reconnectAttemptsRef.current >= maxReconnectAttempts) {
           console.error("[Terminal] Max reconnection attempts reached");
-          const error = new Error("Failed to connect after maximum attempts");
+          const errorMessage = `Failed to connect after ${maxReconnectAttempts} attempts. Last close code: ${event.code}. Please refresh the page or contact support.`;
+          const error = new Error(errorMessage);
           setError(error);
+          setDiagnostics(prev => ({
+            ...prev,
+            attempts: reconnectAttemptsRef.current,
+            lastError: errorMessage,
+          }));
           memoizedOptions.onError?.(error);
         }
       };
@@ -205,5 +255,6 @@ export function useTerminal(
     error,
     executeCommand,
     resizeTerminal,
+    diagnostics,
   };
 }

@@ -9,6 +9,7 @@ export interface SandboxAccount {
   iamUserName: string;
   iamAccessKeyId: string;
   iamSecretAccessKey: string;
+  region: string;
   createdAt: number;
   expiresAt: number;
   status: "creating" | "active" | "destroying" | "destroyed";
@@ -41,7 +42,7 @@ export class AWSControlTowerService {
   /**
    * Create a new sandbox AWS account
    */
-  async createSandboxAccount(userId: string, labId: string): Promise<SandboxAccount> {
+  async createSandboxAccount(userId: string, labId: string, region: string = "ap-south-1"): Promise<SandboxAccount> {
     // if AWS credentials are missing we either are running in local/dev or the service
     // hasn't been configured properly.  In production we want to fail fast with a
     // clear error; for local development we'll return a mock account so that the
@@ -61,6 +62,7 @@ export class AWSControlTowerService {
           iamUserName: "dev-user",
           iamAccessKeyId: "DEVKEY",
           iamSecretAccessKey: "DEVSECRET",
+          region: region,
           createdAt: Date.now(),
           expiresAt: Date.now() + 2 * 60 * 60 * 1000,
           status: "active",
@@ -98,6 +100,7 @@ export class AWSControlTowerService {
         iamUserName: iamUser.userName,
         iamAccessKeyId: iamUser.accessKeyId,
         iamSecretAccessKey: iamUser.secretAccessKey,
+        region: region,
         createdAt: Date.now(),
         expiresAt: Date.now() + 2 * 60 * 60 * 1000, // 2 hours
         status: "active",

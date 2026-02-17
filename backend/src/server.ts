@@ -11,16 +11,33 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Dynamic CORS configuration
+const allowedOrigins: string[] = [
+  "https://ai-chat-two-ecru.vercel.app",
+  "https://ai-chat-eor90dxjd-aadhi-netys-projects.vercel.app",
+  process.env.FRONTEND_URL,
+  "http://localhost:3000",
+  "http://localhost:3001"
+].filter((origin): origin is string => Boolean(origin));
+
 app.use(cors({
-  origin: [
-    "https://ai-chat-two-ecru.vercel.app",
-    "https://ai-chat-eor90dxjd-aadhi-netys-projects.vercel.app"
-  ],
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.includes(origin) || allowedOrigins.some(allowed => origin.includes(allowed))) {
+      callback(null, true);
+    } else {
+      console.warn(`[CORS] Blocked origin: ${origin}`);
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
   methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  allowedHeaders: ["Content-Type", "Authorization", "Upgrade", "Connection"],
   credentials: true
 }));
 
+// Handle preflight requests
 app.options("*", cors());
 
 app.use(express.json());
@@ -162,24 +179,37 @@ app.post("/api/labs/session/:sessionId/end", async (req, res) => {
  */
 wsApp.ws("/terminal/:sessionId", (ws, req) => {
   const { sessionId } = req.params;
+  const startTime = Date.now();
+  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const origin = req.headers.origin || 'unknown';
 
   console.log(`[Terminal] New connection attempt: ${sessionId}`);
+  console.log(`[Terminal] Client IP: ${clientIp}, Origin: ${origin}`);
+  console.log(`[Terminal] Request headers:`, JSON.stringify(req.headers, null, 2));
 
   const session = labSessionService.getSession(sessionId);
 
   if (!session) {
-    console.error(`[Terminal] Session lookup failed for ${sessionId}. Closing connection with 4000 Invalid session.`);
+    const errorMsg = `[Terminal] Session lookup failed for ${sessionId}. Active sessions: ${labSessionService.getActiveSessionIds?.() || 'N/A'}`;
+    console.error(errorMsg);
+    console.error(`[Terminal] Connection attempt took ${Date.now() - startTime}ms`);
     ws.close(4000, "Invalid session");
     return;
   }
 
+  console.log(`[Terminal] Session found for ${sessionId}, lab: ${session.labId}, region: ${session.sandboxAccount?.region || 'not set'}`);
+
   console.log(`[Terminal] Session found for ${sessionId}, creating terminal instance.`);
 
   // Create terminal instance for this connection
+  // Use session region if available, fallback to environment or default
+  const region = session.sandboxAccount?.region || process.env.AWS_REGION || "ap-south-1";
+  console.log(`[Terminal] Using AWS region: ${region} for session ${sessionId}`);
+
   const terminalInstance = terminalServer.createTerminal(sessionId, {
     accessKeyId: session.sandboxAccount.iamAccessKeyId,
     secretAccessKey: session.sandboxAccount.iamSecretAccessKey,
-    region: process.env.AWS_REGION || "us-east-1",
+    region: region,
   });
 
   // Server-side ping interval for keepalive
@@ -233,8 +263,17 @@ wsApp.ws("/terminal/:sessionId", (ws, req) => {
   // Handle errors
   ws.on("error", (error) => {
     console.error(`[Terminal:${sessionId}] WebSocket error:`, error);
+    console.error(`[Terminal:${sessionId}] Error details:`, {
+      message: error.message,
+      code: (error as any).code,
+      type: (error as any).type,
+      stack: error.stack
+    });
     clearInterval(pingInterval);
   });
+
+  // Log successful connection establishment
+  console.log(`[Terminal:${sessionId}] Connection established successfully in ${Date.now() - startTime}ms`);
 
   // Send initial message
   ws.send(
@@ -252,4 +291,20 @@ wsApp.ws("/terminal/:sessionId", (ws, req) => {
 app.listen(PORT, () => {
   console.log(`[Server] AWS Labs Backend running on port ${PORT}`);
   console.log(`[Server] Node environment: ${process.env.NODE_ENV}`);
+  console.log(`[Server] AWS Region: ${process.env.AWS_REGION || "ap-south-1 (default)"}`);
+  console.log(`[Server] Allowed CORS origins: ${allowedOrigins.join(", ")}`);
+  console.log(`[Server] WebSocket endpoint: ws://localhost:${PORT}/terminal/:sessionId`);
+});
+
+// Add diagnostic endpoint
+app.get("/api/diagnostics/websocket", (req, res) => {
+  res.json({
+    status: "ok",
+    websocketEndpoint: `/terminal/:sessionId`,
+    supportedProtocols: ["ws", "wss"],
+    corsOrigins: allowedOrigins,
+    awsRegion: process.env.AWS_REGION || "ap-south-1",
+    timestamp: Date.now(),
+    activeSessions: labSessionService.getActiveSessionIds?.() || "N/A"
+  });
 });

@@ -94,22 +94,33 @@ export class LabSessionService {
     const now = Date.now();
 
     if (!session) {
-      console.warn(`[LabSession] Session not found: ${sessionId}. Active sessions: ${Array.from(this.activeSessions.keys()).join(", ")}`);
+      console.warn(`[LabSession] Session not found: ${sessionId}. Active sessions: ${this.getActiveSessionIds().join(", ") || "none"}`);
+      console.warn(`[LabSession] Total active sessions count: ${this.activeSessions.size}`);
       return undefined;
     }
 
     if (session.status !== "active") {
-      console.warn(`[LabSession] Session ${sessionId} is not active (status: ${session.status})`);
+      console.warn(`[LabSession] Session ${sessionId} is not active (status: ${session.status}, created: ${new Date(session.startedAt).toISOString()})`);
       return undefined;
     }
 
     if (now > session.expiresAt) {
-      console.warn(`[LabSession] Session ${sessionId} has expired. Now: ${now}, ExpiresAt: ${session.expiresAt}`);
+      console.warn(`[LabSession] Session ${sessionId} has expired. Now: ${new Date(now).toISOString()}, ExpiresAt: ${new Date(session.expiresAt).toISOString()}, diff: ${now - session.expiresAt}ms`);
       session.status = "expired";
       return undefined;
     }
 
+    console.log(`[LabSession] Session ${sessionId} validated successfully. Lab: ${session.labId}, expires in ${Math.floor((session.expiresAt - now) / 1000)}s`);
     return session;
+  }
+
+  /**
+   * Get list of active session IDs
+   */
+  getActiveSessionIds(): string[] {
+    return Array.from(this.activeSessions.entries())
+      .filter(([_, session]) => session.status === "active" && Date.now() <= session.expiresAt)
+      .map(([sessionId, _]) => sessionId);
   }
 
   /**
