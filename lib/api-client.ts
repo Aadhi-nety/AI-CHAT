@@ -1,9 +1,34 @@
-// API Base URL for production - set via environment variable in Vercel
-// trim whitespace just in case the value was entered with extra space
-let API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
-if (API_BASE && API_BASE.trim() !== API_BASE) {
-  console.warn("NEXT_PUBLIC_API_URL contains extra whitespace, trimming");
-  API_BASE = API_BASE.trim();
+// ============================================
+// PRODUCTION-READY API CLIENT
+// ============================================
+// 
+// Environment Variables:
+// - NEXT_PUBLIC_API_URL: REST API base URL (e.g., https://your-backend.awsapprunner.com)
+// - NEXT_PUBLIC_WS_URL: WebSocket URL (e.g., wss://your-backend.awsapprunner.com)
+// 
+// For production, set these in Vercel environment settings.
+// For local development, use .env.local file.
+// ============================================
+
+// REST API Base URL
+let API_BASE = process.env.NEXT_PUBLIC_API_URL?.trim() || "";
+
+// WebSocket URL - separate for flexibility
+let WS_BASE = process.env.NEXT_PUBLIC_WS_URL?.trim() || "";
+
+// Fallback: derive WebSocket URL from API URL if not explicitly set
+// This handles the case where only API_URL is configured
+if (!WS_BASE && API_BASE) {
+  const protocol = API_BASE.startsWith("https") ? "wss" : "ws";
+  const url = API_BASE.replace(/^https?:\/\//, "");
+  WS_BASE = `${protocol}://${url}`;
+}
+
+// Debug logging in development
+if (process.env.NODE_ENV === "development") {
+  console.log("[API Client] Environment:", process.env.NODE_ENV);
+  console.log("[API Client] API Base URL:", API_BASE || "(not set - will fail in production)");
+  console.log("[API Client] WebSocket URL:", WS_BASE || "(derived from API_URL or will fail)");
 }
 
 export interface LabStartResponse {
@@ -228,26 +253,31 @@ class APIClient {
 
   /**
    * Get WebSocket URL for terminal
+   * Uses NEXT_PUBLIC_WS_URL for production flexibility
    */
   getTerminalUrl(sessionId: string): string {
-    this.ensureBaseUrl();
-
-    // Validate sessionId format
     if (!sessionId || typeof sessionId !== 'string') {
       throw new Error("Invalid sessionId: must be a non-empty string");
     }
 
-    const protocol = this.baseUrl.startsWith("https") ? "wss" : "ws";
-    const url = this.baseUrl.replace("https://", "").replace("http://", "");
-    const wsUrl = `${protocol}://${url}/terminal/${sessionId}`;
+    let wsUrl: string;
     
-    // Validate URL format
+    if (WS_BASE) {
+      wsUrl = `${WS_BASE}/terminal/${sessionId}`;
+    } else if (this.baseUrl) {
+      const protocol = this.baseUrl.startsWith("https") ? "wss" : "ws";
+      const url = this.baseUrl.replace(/^https?:\/\//, "");
+      wsUrl = `${protocol}://${url}/terminal/${sessionId}`;
+    } else {
+      throw new Error("WebSocket URL not configured. Set NEXT_PUBLIC_WS_URL or NEXT_PUBLIC_API_URL.");
+    }
+
     try {
       new URL(wsUrl);
     } catch (e) {
-      throw new Error(`Invalid WebSocket URL generated: ${wsUrl}`);
+      throw new Error(`Invalid WebSocket URL: ${wsUrl}`);
     }
-    
+
     return wsUrl;
   }
 }

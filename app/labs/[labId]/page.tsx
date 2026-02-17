@@ -102,23 +102,25 @@ export default function LabPage() {
   const [copiedStep, setCopiedStep] = useState<string | null>(null);
 
   const outputRef = useRef<HTMLDivElement>(null);
-  const { isConnected, executeCommand } = useTerminal(
-    sessionId ? `${process.env.NEXT_PUBLIC_BACKEND_URL?.replace("http", "ws") || "ws://localhost:3001"}/terminal/${sessionId}` : "",
-    {
-      onMessage: (msg) => {
-        if (msg.type === "connected") {
-          addOutput("system", msg.message || "Connected to terminal");
-        } else if (msg.type === "output") {
-          addOutput("output", msg.data || "");
-        } else if (msg.type === "error") {
-          addOutput("error", msg.message || "Error occurred");
-        }
-      },
-      onError: (err) => {
-        addOutput("error", `Connection error: ${err.message}`);
-      },
-    }
-  );
+  
+  // Generate WebSocket URL using the apiClient helper for proper protocol handling
+  // This ensures correct URL in both development and production
+  const webSocketUrl = sessionId ? apiClient.getTerminalUrl(sessionId) : "";
+  
+  const { isConnected, executeCommand } = useTerminal(webSocketUrl, {
+    onMessage: (msg) => {
+      if (msg.type === "connected") {
+        addOutput("system", msg.message || "Connected to terminal");
+      } else if (msg.type === "output") {
+        addOutput("output", msg.data || "");
+      } else if (msg.type === "error") {
+        addOutput("error", msg.message || "Error occurred");
+      }
+    },
+    onError: (err) => {
+      addOutput("error", `Connection error: ${err.message}`);
+    },
+  });
 
   const addOutput = (type: TerminalOutput["type"], text: string) => {
     setOutput((prev) => [...prev, { type, text, timestamp: Date.now() }]);
