@@ -43,6 +43,10 @@ export function useTerminal(
 
   const memoizedOptions = useMemo(() => options, [options.onConnect, options.onMessage, options.onError, options.onDisconnect]);
 
+  // Connection timeout (25 seconds - slightly less than server timeout)
+  const CONNECTION_TIMEOUT = 25000;
+  const connectionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
   const connect = useCallback(async () => {
     if (!webSocketUrl || isConnecting || isValidating || ws.current?.readyState === WebSocket.CONNECTING) return;
 
@@ -80,11 +84,36 @@ export function useTerminal(
     connectionStartTimeRef.current = Date.now();
 
     console.log(`[Terminal] Connecting to ${webSocketUrl} (attempt ${reconnectAttemptsRef.current + 1}/${maxReconnectAttempts})`);
+    console.log(`[Terminal] Connection timeout: ${CONNECTION_TIMEOUT}ms`);
+
+    // Set connection timeout
+    connectionTimeoutRef.current = setTimeout(() => {
+      console.error(`[Terminal] Connection timeout after ${CONNECTION_TIMEOUT}ms`);
+      if (ws.current && ws.current.readyState !== WebSocket.CLOSED) {
+        ws.current.close(1008, "Client connection timeout");
+      }
+      setIsConnecting(false);
+      setIsConnected(false);
+      const timeoutError = new Error(`Connection timeout - no response from server after ${CONNECTION_TIMEOUT}ms. The server may be busy or unreachable.`);
+      setError(timeoutError);
+      setDiagnostics(prev => ({
+        ...prev,
+        lastError: timeoutError.message,
+        attempts: reconnectAttemptsRef.current,
+      }));
+      memoizedOptions.onError?.(timeoutError);
+    }, CONNECTION_TIMEOUT);
 
     try {
       ws.current = new WebSocket(webSocketUrl);
 
       ws.current.onopen = () => {
+        // Clear connection timeout
+        if (connectionTimeoutRef.current) {
+          clearTimeout(connectionTimeoutRef.current);
+          connectionTimeoutRef.current = null;
+        }
+
         const connectionTime = Date.now() - connectionStartTimeRef.current;
         console.log(`[Terminal] Connected in ${connectionTime}ms`);
         setIsConnected(true);
@@ -141,28 +170,45 @@ export function useTerminal(
 
       ws.current.onerror = (event) => {
         console.error("[Terminal] WebSocket error:", event);
+        
+        // Clear connection timeout on error
+        if (connectionTimeoutRef.current) {
+          clearTimeout(connectionTimeoutRef.current);
+          connectionTimeoutRef.current = null;
+        }
+        
         setIsConnected(false);
         setIsConnecting(false);
         
-        // Determine specific error message
+        // Determine specific error message based on context
         let errorMessage = "WebSocket connection failed";
+        let errorCode = "CONNECTION_FAILED";
+        
         if (reconnectAttemptsRef.current >= maxReconnectAttempts) {
           errorMessage = "Failed to connect after maximum attempts. Please check your network connection and try again.";
+          errorCode = "MAX_RETRIES_EXCEEDED";
         } else if (!navigator.onLine) {
           errorMessage = "You appear to be offline. Please check your internet connection.";
+          errorCode = "OFFLINE";
         } else if (webSocketUrl.startsWith("wss://") && window.location.protocol === "http:") {
           errorMessage = "Mixed content error: Cannot connect to secure WebSocket from HTTP page.";
+          errorCode = "MIXED_CONTENT";
+        } else if (webSocketUrl.includes("awsapprunner.com")) {
+          errorMessage = "AWS App Runner WebSocket connection failed. This may be due to: 1) Service still starting, 2) Session not found, 3) Network issues. Please try again in a few moments.";
+          errorCode = "AWS_APP_RUNNER_ERROR";
         }
         
         setDiagnostics(prev => ({
           ...prev,
           attempts: reconnectAttemptsRef.current,
           lastError: errorMessage,
+          errorCode,
         }));
         
         // Only call onError if we're not already in a reconnect attempt
         if (reconnectAttemptsRef.current === 0) {
           const error = new Error(errorMessage);
+          (error as any).code = errorCode;
           setError(error);
           memoizedOptions.onError?.(error);
         }
@@ -170,6 +216,13 @@ export function useTerminal(
 
       ws.current.onclose = (event) => {
         console.log(`[Terminal] Disconnected: ${event.code} ${event.reason}`);
+        
+        // Clear connection timeout
+        if (connectionTimeoutRef.current) {
+          clearTimeout(connectionTimeoutRef.current);
+          connectionTimeoutRef.current = null;
+        }
+        
         setIsConnected(false);
         setIsConnecting(false);
 
@@ -181,26 +234,51 @@ export function useTerminal(
 
         memoizedOptions.onDisconnect?.();
 
-        // Handle specific error codes
+        // Handle specific error codes with detailed messages
         const isInvalidSession = event.code === 4000;
         const isServerError = event.code >= 4500;
+        const isConnectionTimeout = event.code === 1008;
+        const isAbnormalClosure = event.code === 1006;
         
         if (isInvalidSession) {
           console.error("[Terminal] Invalid session - will not retry");
           const errorMessage = "Session is invalid or has expired. Please start a new lab session.";
           const error = new Error(errorMessage);
+          (error as any).code = "SESSION_INVALID";
           setError(error);
           setDiagnostics(prev => ({
             ...prev,
             attempts: reconnectAttemptsRef.current,
             lastError: errorMessage,
+            errorCode: "SESSION_INVALID",
           }));
           memoizedOptions.onError?.(error);
           return; // Don't retry on invalid session
         }
 
+        if (isConnectionTimeout) {
+          console.error("[Terminal] Connection timeout from server");
+          const errorMessage = "Connection timed out. The server took too long to respond. Please try again.";
+          const error = new Error(errorMessage);
+          (error as any).code = "CONNECTION_TIMEOUT";
+          setError(error);
+          setDiagnostics(prev => ({
+            ...prev,
+            attempts: reconnectAttemptsRef.current,
+            lastError: errorMessage,
+            errorCode: "CONNECTION_TIMEOUT",
+          }));
+          memoizedOptions.onError?.(error);
+          return; // Don't retry on timeout
+        }
+
+        if (isAbnormalClosure) {
+          console.error("[Terminal] Abnormal closure - possible network or proxy issue");
+          // This is often a proxy/firewall issue, still try to reconnect
+        }
+
         // Attempt to reconnect if not a normal closure and under max attempts
-        if (event.code !== 1000 && !isServerError && reconnectAttemptsRef.current < maxReconnectAttempts) {
+        if (event.code !== 1000 && !isServerError && !isConnectionTimeout && reconnectAttemptsRef.current < maxReconnectAttempts) {
           reconnectAttemptsRef.current++;
           // Exponential backoff: base delay * 2^(attempt - 1)
           const backoffDelay = reconnectDelay * Math.pow(2, reconnectAttemptsRef.current - 1);
@@ -208,7 +286,8 @@ export function useTerminal(
           setDiagnostics(prev => ({
             ...prev,
             attempts: reconnectAttemptsRef.current,
-            lastError: `Connection closed (code: ${event.code}). Retrying...`,
+            lastError: `Connection closed (code: ${event.code}${event.reason ? `: ${event.reason}` : ''}). Retrying...`,
+            errorCode: `WS_CLOSE_${event.code}`,
           }));
           reconnectTimeoutRef.current = setTimeout(() => {
             connect();
@@ -217,22 +296,36 @@ export function useTerminal(
           console.error("[Terminal] Max reconnection attempts reached or server error");
           const errorMessage = isServerError 
             ? `Server error (code: ${event.code}). Please try again later.`
-            : `Failed to connect after ${maxReconnectAttempts} attempts. Last close code: ${event.code}. Please refresh the page or contact support.`;
+            : `Failed to connect after ${maxReconnectAttempts} attempts. Last close code: ${event.code}${event.reason ? ` (${event.reason})` : ''}. Please refresh the page or contact support.`;
           const error = new Error(errorMessage);
+          (error as any).code = isServerError ? "SERVER_ERROR" : "MAX_RETRIES_EXCEEDED";
           setError(error);
           setDiagnostics(prev => ({
             ...prev,
             attempts: reconnectAttemptsRef.current,
             lastError: errorMessage,
+            errorCode: isServerError ? "SERVER_ERROR" : "MAX_RETRIES_EXCEEDED",
           }));
           memoizedOptions.onError?.(error);
         }
       };
     } catch (err) {
+      // Clear connection timeout on error
+      if (connectionTimeoutRef.current) {
+        clearTimeout(connectionTimeoutRef.current);
+        connectionTimeoutRef.current = null;
+      }
+      
       const error = err instanceof Error ? err : new Error("Failed to create WebSocket");
       console.error("[Terminal] Failed to connect:", error);
+      (error as any).code = "WEBSOCKET_CREATION_FAILED";
       setError(error);
       setIsConnecting(false);
+      setDiagnostics(prev => ({
+        ...prev,
+        lastError: error.message,
+        errorCode: "WEBSOCKET_CREATION_FAILED",
+      }));
       memoizedOptions.onError?.(error);
     }
   }, [webSocketUrl, isConnecting, memoizedOptions.onConnect, memoizedOptions.onMessage, memoizedOptions.onError, memoizedOptions.onDisconnect]);
@@ -240,12 +333,18 @@ export function useTerminal(
   // Connect to WebSocket
   useEffect(() => {
     if (webSocketUrl) {
+      console.log(`[Terminal] URL changed, connecting to: ${webSocketUrl}`);
       connect();
     } else {
       // Clear any pending reconnect
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
         reconnectTimeoutRef.current = null;
+      }
+      // Clear connection timeout
+      if (connectionTimeoutRef.current) {
+        clearTimeout(connectionTimeoutRef.current);
+        connectionTimeoutRef.current = null;
       }
       // Clear ping interval
       if (pingIntervalRef.current) {
@@ -258,9 +357,15 @@ export function useTerminal(
     }
 
     return () => {
+      console.log("[Terminal] Cleaning up WebSocket connection");
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
         reconnectTimeoutRef.current = null;
+      }
+      // Clear connection timeout
+      if (connectionTimeoutRef.current) {
+        clearTimeout(connectionTimeoutRef.current);
+        connectionTimeoutRef.current = null;
       }
       // Clear ping interval
       if (pingIntervalRef.current) {

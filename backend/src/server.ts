@@ -3,6 +3,7 @@ import expressWs from "express-ws";
 import cors from "cors";
 import dotenv from "dotenv";
 import { WebSocket } from "ws";
+import http from "http";
 import labSessionService from "./services/lab-session.service";
 import { TerminalServer } from "./terminal-server";
 
@@ -21,8 +22,9 @@ const allowedOrigins: string[] = [
   "http://localhost:3001"
 ].filter((origin): origin is string => Boolean(origin));
 
-app.use(cors({
-  origin: (origin, callback) => {
+// Enhanced CORS for WebSocket support
+const corsOptions = {
+  origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
     
@@ -34,17 +36,24 @@ app.use(cors({
     }
   },
   methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "Upgrade", "Connection"],
-  credentials: true
-}));
+  allowedHeaders: ["Content-Type", "Authorization", "Upgrade", "Connection", "Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Extensions"],
+  exposedHeaders: ["Upgrade", "Connection"],
+  credentials: true,
+  maxAge: 86400 // 24 hours
+};
 
-// Handle preflight requests
-app.options("*", cors());
+app.use(cors(corsOptions));
+
+// Handle preflight requests explicitly
+app.options("*", cors(corsOptions));
 
 app.use(express.json());
 
-// Initialize express-ws
-const { app: wsApp } = expressWs(app);
+// Create HTTP server first (required for proper WebSocket support)
+const server = http.createServer(app);
+
+// Initialize express-ws with the HTTP server
+const { app: wsApp } = expressWs(app, server);
 
 // Initialize terminal server
 const terminalServer = new TerminalServer();
@@ -52,9 +61,54 @@ const terminalServer = new TerminalServer();
 // Helper function for delay
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+// WebSocket connection timeout (30 seconds)
+const WS_CONNECTION_TIMEOUT = 30000;
+
 // Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: Date.now() });
+  res.json({ 
+    status: "ok", 
+    timestamp: Date.now(),
+    websocket: "available",
+    endpoints: ["/terminal/:sessionId", "/ws-test"]
+  });
+});
+
+// WebSocket test endpoint for connectivity verification
+wsApp.ws("/ws-test", (ws, req) => {
+  console.log(`[WebSocket Test] Connection from ${req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
+  
+  ws.on("message", (msg: string) => {
+    try {
+      const data = JSON.parse(msg);
+      console.log(`[WebSocket Test] Received:`, data);
+      
+      // Echo back with timestamp
+      ws.send(JSON.stringify({
+        type: "echo",
+        received: data,
+        timestamp: Date.now(),
+        server: "aws-app-runner"
+      }));
+    } catch (e) {
+      ws.send(JSON.stringify({
+        type: "error",
+        message: "Invalid JSON",
+        timestamp: Date.now()
+      }));
+    }
+  });
+  
+  ws.on("close", (code, reason) => {
+    console.log(`[WebSocket Test] Closed: ${code} ${reason}`);
+  });
+  
+  // Send welcome message
+  ws.send(JSON.stringify({
+    type: "connected",
+    message: "WebSocket test endpoint - send any JSON message to echo",
+    timestamp: Date.now()
+  }));
 });
 
 // API Routes
@@ -186,10 +240,25 @@ wsApp.ws("/terminal/:sessionId", async (ws, req) => {
   const startTime = Date.now();
   const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   const origin = req.headers.origin || 'unknown';
+  
+  // Set connection timeout
+  const connectionTimeout = setTimeout(() => {
+    console.error(`[Terminal:${sessionId}] Connection timeout after ${WS_CONNECTION_TIMEOUT}ms`);
+    try {
+      ws.send(JSON.stringify({
+        type: "error",
+        message: "Connection timeout - session validation took too long",
+        code: "CONNECTION_TIMEOUT"
+      }));
+      ws.close(1008, "Connection timeout");
+    } catch (e) {
+      // Connection may already be closed
+    }
+  }, WS_CONNECTION_TIMEOUT);
 
   console.log(`[Terminal] New connection attempt: ${sessionId}`);
   console.log(`[Terminal] Client IP: ${clientIp}, Origin: ${origin}`);
-  console.log(`[Terminal] Request headers:`, JSON.stringify(req.headers, null, 2));
+  console.log(`[Terminal] WebSocket readyState: ${ws.readyState}`);
 
   // Retry session lookup with exponential backoff
   let session = await labSessionService.getSession(sessionId);
@@ -204,6 +273,9 @@ wsApp.ws("/terminal/:sessionId", async (ws, req) => {
     session = await labSessionService.getSession(sessionId);
   }
 
+  // Clear connection timeout
+  clearTimeout(connectionTimeout);
+
   if (!session) {
     const activeSessionIds = await labSessionService.getActiveSessionIds();
     const errorMsg = `[Terminal] Session lookup failed for ${sessionId} after ${retryCount} retries. Active sessions: ${activeSessionIds.join(", ") || 'N/A'}`;
@@ -212,18 +284,28 @@ wsApp.ws("/terminal/:sessionId", async (ws, req) => {
     
     // Send detailed error to client before closing
     try {
-      ws.send(JSON.stringify({
-        type: "error",
-        message: "Session not found or expired",
-        code: "SESSION_NOT_FOUND",
-        sessionId: sessionId,
-        timestamp: Date.now()
-      }));
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "error",
+          message: "Session not found or expired",
+          code: "SESSION_NOT_FOUND",
+          sessionId: sessionId,
+          timestamp: Date.now()
+        }));
+      }
     } catch (e) {
       // Client may have already disconnected
+      console.error(`[Terminal:${sessionId}] Error sending session not found message:`, e);
     }
     
-    ws.close(4000, "Invalid session");
+    // Close with delay to allow message to be sent
+    setTimeout(() => {
+      try {
+        ws.close(4000, "Invalid session");
+      } catch (e) {
+        // Already closed
+      }
+    }, 100);
     return;
   }
 
@@ -287,6 +369,7 @@ wsApp.ws("/terminal/:sessionId", async (ws, req) => {
   ws.on("close", (code, reason) => {
     console.log(`[Terminal] Connection closed: ${sessionId}, code: ${code}, reason: ${reason}`);
     clearInterval(pingInterval);
+    clearTimeout(connectionTimeout);
     terminalServer.destroyTerminal(sessionId);
   });
 
@@ -297,9 +380,11 @@ wsApp.ws("/terminal/:sessionId", async (ws, req) => {
       message: error.message,
       code: (error as any).code,
       type: (error as any).type,
-      stack: error.stack
+      stack: error.stack,
+      readyState: ws.readyState
     });
     clearInterval(pingInterval);
+    clearTimeout(connectionTimeout);
   });
 
   // Log successful connection establishment
@@ -317,13 +402,16 @@ wsApp.ws("/terminal/:sessionId", async (ws, req) => {
   );
 });
 
-// Start server
-app.listen(PORT, () => {
+// Start server using the HTTP server instance
+server.listen(PORT, () => {
   console.log(`[Server] AWS Labs Backend running on port ${PORT}`);
   console.log(`[Server] Node environment: ${process.env.NODE_ENV}`);
   console.log(`[Server] AWS Region: ${process.env.AWS_REGION || "ap-south-1 (default)"}`);
   console.log(`[Server] Allowed CORS origins: ${allowedOrigins.join(", ")}`);
-  console.log(`[Server] WebSocket endpoint: ws://localhost:${PORT}/terminal/:sessionId`);
+  console.log(`[Server] WebSocket endpoints:`);
+  console.log(`  - ws://localhost:${PORT}/terminal/:sessionId`);
+  console.log(`  - ws://localhost:${PORT}/ws-test (test endpoint)`);
+  console.log(`[Server] Connection timeout: ${WS_CONNECTION_TIMEOUT}ms`);
 });
 
 // Add diagnostic endpoint
@@ -331,12 +419,20 @@ app.get("/api/diagnostics/websocket", async (req, res) => {
   const activeSessions = await labSessionService.getActiveSessionIds();
   res.json({
     status: "ok",
-    websocketEndpoint: `/terminal/:sessionId`,
+    websocketEndpoints: [
+      { path: "/terminal/:sessionId", description: "Terminal connection" },
+      { path: "/ws-test", description: "WebSocket test endpoint" }
+    ],
     supportedProtocols: ["ws", "wss"],
     corsOrigins: allowedOrigins,
     awsRegion: process.env.AWS_REGION || "ap-south-1",
+    connectionTimeout: WS_CONNECTION_TIMEOUT,
     timestamp: Date.now(),
-    activeSessions: activeSessions || "N/A"
+    activeSessions: activeSessions || "N/A",
+    serverInfo: {
+      platform: "aws-app-runner",
+      nodeVersion: process.version
+    }
   });
 });
 
