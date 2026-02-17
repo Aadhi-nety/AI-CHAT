@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from "uuid";
 import awsControlTowerService, { SandboxAccount } from "./aws-control-tower.service";
 import cyberangeService from "./cyberange.service";
+import redisService from "./redis.service";
 
 export interface LabSession {
   sessionId: string;
@@ -17,8 +18,6 @@ export interface LabSession {
 }
 
 export class LabSessionService {
-  private activeSessions: Map<string, LabSession> = new Map();
-
   /**
    * Create a new lab session
    */
@@ -71,16 +70,14 @@ export class LabSessionService {
         webSocketUrl,
       };
 
-      // Store session
-      this.activeSessions.set(sessionId, session);
+      // Store session in Redis (shared across all backend instances)
+      const ttlSeconds = Math.ceil((expiresAt - startedAt) / 1000);
+      await redisService.setSession(sessionId, session, ttlSeconds);
 
       // Notify Cyberange
       await cyberangeService.notifyLabStarted(purchaseId, sessionId);
 
-      // Set expiry timer
-      this.setSessionExpiry(sessionId);
-
-      console.log(`[LabSession] Session created: ${sessionId}, expiresAt: ${new Date(expiresAt).toISOString()}, now: ${new Date(startedAt).toISOString()}`);
+      console.log(`[LabSession] Session created: ${sessionId}, expiresAt: ${new Date(expiresAt).toISOString()}, now: ${new Date(startedAt).toISOString()}, redisTTL: ${ttlSeconds}s`);
       return session;
     } catch (error) {
       console.error("[LabSession] Failed to create session:", error);
@@ -91,14 +88,15 @@ export class LabSessionService {
   /**
    * Get active session with grace period for newly created sessions
    */
-  getSession(sessionId: string): LabSession | undefined {
-    const session = this.activeSessions.get(sessionId);
+  async getSession(sessionId: string): Promise<LabSession | undefined> {
+    const session = await redisService.getSession(sessionId) as LabSession | null;
     const now = Date.now();
     const GRACE_PERIOD_MS = 10000; // 10 second grace period for session initialization
 
     if (!session) {
-      console.warn(`[LabSession] Session not found: ${sessionId}. Active sessions: ${this.getActiveSessionIds().join(", ") || "none"}`);
-      console.warn(`[LabSession] Total active sessions count: ${this.activeSessions.size}`);
+      const allSessionIds = await redisService.getAllSessionIds();
+      console.warn(`[LabSession] Session not found in Redis: ${sessionId}. Active sessions: ${allSessionIds.join(", ") || "none"}`);
+      console.warn(`[LabSession] Total active sessions count: ${allSessionIds.length}`);
       return undefined;
     }
 
@@ -113,6 +111,7 @@ export class LabSessionService {
     if (now > session.expiresAt) {
       console.warn(`[LabSession] Session ${sessionId} has expired. Now: ${new Date(now).toISOString()}, ExpiresAt: ${new Date(session.expiresAt).toISOString()}, diff: ${now - session.expiresAt}ms`);
       session.status = "expired";
+      await redisService.setSession(sessionId, session, 60); // Keep expired session for 1 minute for cleanup
       return undefined;
     }
 
@@ -120,6 +119,9 @@ export class LabSessionService {
     if (isInGracePeriod && session.status !== "active") {
       console.log(`[LabSession] Auto-activating session ${sessionId} (in grace period)`);
       session.status = "active";
+      // Update in Redis
+      const ttlSeconds = Math.ceil((session.expiresAt - now) / 1000);
+      await redisService.setSession(sessionId, session, ttlSeconds);
     }
 
     console.log(`[LabSession] Session ${sessionId} validated successfully. Lab: ${session.labId}, expires in ${Math.floor((session.expiresAt - now) / 1000)}s, age: ${now - session.createdAt}ms`);
@@ -129,10 +131,19 @@ export class LabSessionService {
   /**
    * Get list of active session IDs
    */
-  getActiveSessionIds(): string[] {
-    return Array.from(this.activeSessions.entries())
-      .filter(([_, session]) => session.status === "active" && Date.now() <= session.expiresAt)
-      .map(([sessionId, _]) => sessionId);
+  async getActiveSessionIds(): Promise<string[]> {
+    const allIds = await redisService.getAllSessionIds();
+    const activeIds: string[] = [];
+    const now = Date.now();
+
+    for (const sessionId of allIds) {
+      const session = await redisService.getSession(sessionId) as LabSession | null;
+      if (session && session.status === "active" && now <= session.expiresAt) {
+        activeIds.push(sessionId);
+      }
+    }
+
+    return activeIds;
   }
 
   /**
@@ -140,10 +151,10 @@ export class LabSessionService {
    */
   async destroySession(sessionId: string): Promise<void> {
     try {
-      const session = this.activeSessions.get(sessionId);
+      const session = await redisService.getSession(sessionId) as LabSession | null;
 
       if (!session) {
-        console.warn(`[LabSession] Session not found: ${sessionId}`);
+        console.warn(`[LabSession] Session not found in Redis: ${sessionId}`);
         return;
       }
 
@@ -164,7 +175,9 @@ export class LabSessionService {
       );
 
       session.status = "destroyed";
-      this.activeSessions.delete(sessionId);
+      // Keep destroyed session for 1 minute for reference, then delete
+      await redisService.setSession(sessionId, session, 60);
+      setTimeout(() => redisService.deleteSession(sessionId), 60000);
 
       console.log(`[LabSession] Session destroyed: ${sessionId}`);
     } catch (error) {
@@ -174,21 +187,23 @@ export class LabSessionService {
   }
 
   /**
-   * Set automatic session expiry
+   * Set automatic session expiry - Redis handles TTL automatically
+   * This method is kept for backward compatibility but Redis TTL is primary
    */
   private setSessionExpiry(sessionId: string): void {
-    const checkInterval = 60000; // Check every minute
+    // Redis handles expiry via TTL, but we keep a cleanup check for any orphaned sessions
+    const checkInterval = 300000; // Check every 5 minutes (less frequent since Redis has TTL)
 
     const timer = setInterval(async () => {
-      const session = this.activeSessions.get(sessionId);
+      const session = await redisService.getSession(sessionId) as LabSession | null;
 
       if (!session) {
         clearInterval(timer);
         return;
       }
 
-      if (Date.now() > session.expiresAt) {
-        console.log(`[LabSession] Session expired: ${sessionId}`);
+      if (Date.now() > session.expiresAt && session.status === "active") {
+        console.log(`[LabSession] Session expired (cleanup check): ${sessionId}`);
         await this.destroySession(sessionId);
         clearInterval(timer);
       }
@@ -198,24 +213,37 @@ export class LabSessionService {
   /**
    * Get all active sessions for a user
    */
-  getUserSessions(userId: string): LabSession[] {
-    return Array.from(this.activeSessions.values()).filter(
-      (s) => s.userId === userId && s.status === "active"
-    );
+  async getUserSessions(userId: string): Promise<LabSession[]> {
+    const allIds = await redisService.getAllSessionIds();
+    const userSessions: LabSession[] = [];
+
+    for (const sessionId of allIds) {
+      const session = await redisService.getSession(sessionId) as LabSession | null;
+      if (session && session.userId === userId && session.status === "active") {
+        userSessions.push(session);
+      }
+    }
+
+    return userSessions;
   }
 
   /**
    * Extend session expiry
    */
-  extendSession(sessionId: string, additionalMinutes: number = 30): void {
-    const session = this.activeSessions.get(sessionId);
+  async extendSession(sessionId: string, additionalMinutes: number = 30): Promise<void> {
+    const session = await redisService.getSession(sessionId) as LabSession | null;
 
     if (session && session.status === "active") {
       session.expiresAt += additionalMinutes * 60 * 1000;
+      const newTtlSeconds = Math.ceil((session.expiresAt - Date.now()) / 1000);
+      
+      // Update in Redis with new TTL
+      await redisService.setSession(sessionId, session, newTtlSeconds);
+      
       console.log(
         `[LabSession] Session extended: ${sessionId} (new expiry: ${new Date(
           session.expiresAt
-        ).toISOString()})`
+        ).toISOString()}, new TTL: ${newTtlSeconds}s)`
       );
     }
   }

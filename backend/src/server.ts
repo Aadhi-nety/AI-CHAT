@@ -103,10 +103,10 @@ app.post("/api/labs/start", async (req, res) => {
  * GET /api/labs/session/:sessionId
  * Get session details
  */
-app.get("/api/labs/session/:sessionId", (req, res) => {
+app.get("/api/labs/session/:sessionId", async (req, res) => {
   try {
     const { sessionId } = req.params;
-    const session = labSessionService.getSession(sessionId);
+    const session = await labSessionService.getSession(sessionId);
 
     if (!session) {
       return res.status(404).json({ error: "Session not found or expired" });
@@ -132,18 +132,18 @@ app.get("/api/labs/session/:sessionId", (req, res) => {
  * POST /api/labs/session/:sessionId/extend
  * Extend session time
  */
-app.post("/api/labs/session/:sessionId/extend", (req, res) => {
+app.post("/api/labs/session/:sessionId/extend", async (req, res) => {
   try {
     const { sessionId } = req.params;
     const { minutes = 30 } = req.body;
 
-    const session = labSessionService.getSession(sessionId);
+    const session = await labSessionService.getSession(sessionId);
 
     if (!session) {
       return res.status(404).json({ error: "Session not found" });
     }
 
-    labSessionService.extendSession(sessionId, minutes);
+    await labSessionService.extendSession(sessionId, minutes);
 
     res.json({
       success: true,
@@ -191,7 +191,7 @@ wsApp.ws("/terminal/:sessionId", async (ws, req) => {
   console.log(`[Terminal] Request headers:`, JSON.stringify(req.headers, null, 2));
 
   // Retry session lookup with exponential backoff
-  let session = labSessionService.getSession(sessionId);
+  let session = await labSessionService.getSession(sessionId);
   let retryCount = 0;
   const maxRetries = 3;
   
@@ -200,11 +200,12 @@ wsApp.ws("/terminal/:sessionId", async (ws, req) => {
     const backoffMs = Math.min(100 * Math.pow(2, retryCount - 1), 1000); // Max 1 second
     console.log(`[Terminal] Session not found, retrying in ${backoffMs}ms (attempt ${retryCount}/${maxRetries})`);
     await delay(backoffMs);
-    session = labSessionService.getSession(sessionId);
+    session = await labSessionService.getSession(sessionId);
   }
 
   if (!session) {
-    const errorMsg = `[Terminal] Session lookup failed for ${sessionId} after ${retryCount} retries. Active sessions: ${labSessionService.getActiveSessionIds?.().join(", ") || 'N/A'}`;
+    const activeSessionIds = await labSessionService.getActiveSessionIds();
+    const errorMsg = `[Terminal] Session lookup failed for ${sessionId} after ${retryCount} retries. Active sessions: ${activeSessionIds.join(", ") || 'N/A'}`;
     console.error(errorMsg);
     console.error(`[Terminal] Connection attempt took ${Date.now() - startTime}ms`);
     
@@ -325,7 +326,8 @@ app.listen(PORT, () => {
 });
 
 // Add diagnostic endpoint
-app.get("/api/diagnostics/websocket", (req, res) => {
+app.get("/api/diagnostics/websocket", async (req, res) => {
+  const activeSessions = await labSessionService.getActiveSessionIds();
   res.json({
     status: "ok",
     websocketEndpoint: `/terminal/:sessionId`,
@@ -333,7 +335,7 @@ app.get("/api/diagnostics/websocket", (req, res) => {
     corsOrigins: allowedOrigins,
     awsRegion: process.env.AWS_REGION || "ap-south-1",
     timestamp: Date.now(),
-    activeSessions: labSessionService.getActiveSessionIds?.() || "N/A"
+    activeSessions: activeSessions || "N/A"
   });
 });
 
@@ -341,10 +343,10 @@ app.get("/api/diagnostics/websocket", (req, res) => {
  * GET /api/labs/session/:sessionId/validate
  * Validate session without establishing WebSocket connection
  */
-app.get("/api/labs/session/:sessionId/validate", (req, res) => {
+app.get("/api/labs/session/:sessionId/validate", async (req, res) => {
   try {
     const { sessionId } = req.params;
-    const session = labSessionService.getSession(sessionId);
+    const session = await labSessionService.getSession(sessionId);
 
     if (!session) {
       return res.status(404).json({
