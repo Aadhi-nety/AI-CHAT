@@ -103,6 +103,18 @@ CYBERANGE_API_KEY=your_api_key
 JWT_SECRET=your_secret_key_here
 LAB_TIMEOUT_MINUTES=120
 LAB_IDLE_TIMEOUT_MINUTES=30
+
+# If you deploy the backend to AWS App Runner (or any public host),
+# set the public URL here as well.  the frontend needs two matching
+# environment variables so it can call the REST API and open the
+# WebSocket connection:
+#
+#   NEXT_PUBLIC_API_URL=https://2rrfaahu3d.ap-south-1.awsapprunner.com
+#   NEXT_PUBLIC_BACKEND_URL=https://2rrfaahu3d.ap-south-1.awsapprunner.com
+#
+# (remove any trailing whitespace; the client will trim but warns otherwise.)
+# Update these in your Next.js `.env.production`/Vercel settings before
+# building the frontend.
 ```
 
 ## Step 7: Deploy the Service

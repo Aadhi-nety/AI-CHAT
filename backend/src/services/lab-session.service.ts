@@ -50,6 +50,12 @@ export class LabSessionService {
       const expiresAt =
         startedAt + (parseInt(process.env.LAB_TIMEOUT_MINUTES || "120") * 60 * 1000);
 
+      // Generate proper WebSocket URL based on environment
+      const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 3001}`;
+      const wsProtocol = backendUrl.startsWith("https") ? "wss" : "ws";
+      const wsHost = backendUrl.replace(/^https?:\/\//, "");
+      const webSocketUrl = `${wsProtocol}://${wsHost}/terminal/${sessionId}`;
+
       const session: LabSession = {
         sessionId,
         userId,
@@ -60,7 +66,7 @@ export class LabSessionService {
         expiresAt,
         status: "active",
         terminalPort: 3100 + Math.floor(Math.random() * 900),
-      webSocketUrl: `ws://localhost:${process.env.PORT || 3002}/terminal/${sessionId}`,
+        webSocketUrl,
       };
 
       // Store session
