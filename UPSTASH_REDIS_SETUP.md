@@ -1,120 +1,91 @@
-# Upstash Redis Setup for AWS App Runner
+# Upstash Redis Setup Guide for AWS App Runner
 
-## Overview
-This implementation uses Upstash Redis (serverless external Redis) for shared session storage across AWS App Runner container instances. No VPC configuration or ElastiCache permissions required.
-
-## Configuration
+## Quick Start
 
 ### 1. Create Upstash Redis Database
 
 1. Go to [Upstash Console](https://console.upstash.com)
-2. Create a new Redis database
-3. Choose region closest to your AWS App Runner deployment
-4. Copy the Redis URL (format: `redis://default:password@host:port`)
+2. Click "Create Database"
+3. Select region closest to your AWS App Runner service
+4. Choose "Redis" as the type
+5. Note down the Redis URL (format: `redis://default:password@host:port`)
 
-### 2. AWS App Runner Environment Variables
+### 2. Configure AWS App Runner
 
-Set this environment variable in your AWS App Runner service:
+**CRITICAL: Environment variables must be set in AWS App Runner Console, NOT in .env file**
 
+1. Go to [AWS App Runner Console](https://console.aws.amazon.com/apprunner)
+2. Select your service
+3. Click **"Configuration"** tab
+4. Under **"Environment variables"**, click **"Edit"**
+5. Add the following environment variable:
+   - **Name**: `REDIS_URL`
+   - **Value**: `redis://default:YOUR_PASSWORD@YOUR_ENDPOINT.upstash.io:6379`
+6. Click **"Save changes"**
+7. Click **"Deploy"** to redeploy with new configuration
+
+### 3. Verify Deployment
+
+Check App Runner logs for:
 ```
-REDIS_URL=redis://default:your-password@your-instance.upstash.io:6379
-```
-
-**Important:** Do NOT include the `rediss://` prefix - use `redis://` even for TLS connections. The code automatically enables TLS for Upstash URLs.
-
-### 3. Local Development
-
-For local development, you can:
-- Use the same Upstash Redis URL (recommended for testing production-like behavior)
-- Or set up a local Redis instance and use: `REDIS_URL=redis://localhost:6379`
-
-## Features
-
-### Session Storage
-- Sessions stored in Redis with automatic TTL (2 hours default)
-- Grace period: 10 seconds for session activation
-- All session operations are async/await
-
-### Connection Handling
-- Automatic TLS for Upstash connections
-- Connection retry with exponential backoff (max 10 attempts)
-- Connection timeout: 10 seconds
-- Command timeout: 5 seconds
-
-### Error Handling
-- No in-memory fallback in production (fail fast)
-- Detailed logging for all Redis operations
-- Health check endpoint: `/api/diagnostics/websocket`
-
-## Health Check
-
-Test Redis connectivity:
-
-```bash
-curl https://your-app-runner-url/api/diagnostics/websocket
+[Redis] Connected successfully to Upstash
+[Redis] Client ready - session storage operational
 ```
 
-Expected response:
-```json
-{
-  "status": "ok",
-  "websocketEndpoint": "/terminal/:sessionId",
-  "supportedProtocols": ["ws", "wss"],
-  "corsOrigins": ["..."],
-  "awsRegion": "us-east-1",
-  "timestamp": 1234567890,
-  "activeSessions": ["session-id-1", "session-id-2"]
-}
+## Environment Variable Format
+
 ```
+REDIS_URL=redis://default:password@endpoint.upstash.io:6379
+```
+
+**Important**: Do NOT include `redis-cli --tls -u` prefix - just the URL.
 
 ## Troubleshooting
 
-### Connection Issues
-Check logs for:
-- `[Redis] CRITICAL: REDIS_URL environment variable is not set`
-- `[Redis] Connecting to: redis://default:****@host:port`
-- `[Redis] Connected successfully to Upstash`
+### Error: "REDIS_URL is required for production session storage"
 
-### Session Not Found
-- Verify session was created: Check `[LabSession] Session created` log
-- Verify Redis storage: Check `[Redis] Session stored` log
-- Check session TTL hasn't expired
+**Cause**: Environment variable not set in AWS App Runner
 
-### WebSocket Connection Fails
-1. Check session exists: `GET /api/labs/session/:sessionId/validate`
-2. Verify Redis health: `GET /api/diagnostics/websocket`
-3. Check WebSocket URL format in client
+**Solution**: Follow step 2 above to add REDIS_URL in App Runner Console.
+
+### Error: "Invalid REDIS_URL format"
+
+**Cause**: URL format is incorrect
+
+**Solution**: Ensure URL starts with `redis://` or `rediss://`, not `redis-cli`.
+
+### Connection Timeout
+
+**Cause**: Network issues or incorrect endpoint
+
+**Solution**: 
+- Verify endpoint is correct in Upstash console
+- Check security group rules allow outbound connections
+- Ensure TLS is enabled (automatic for upstash.io domains)
+
+## Local Development
+
+Create `backend/.env` file:
+
+```env
+REDIS_URL=redis://default:password@localhost:6379
+PORT=3001
+NODE_ENV=development
+```
 
 ## Architecture
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   AWS App       │     │   Upstash       │     │   AWS App       │
-│   Runner        │◄───►│   Redis         │◄───►│   Runner        │
+│   App Runner    │────▶│  Upstash Redis  │◀────│   App Runner    │
 │   Instance 1    │     │   (Serverless)  │     │   Instance 2    │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
-         │                                               │
-         └──────────────────┬────────────────────────────┘
-                            │
-                   ┌────────▼────────┐
-                   │  WebSocket       │
-                   │  Terminal        │
-                   │  Connections   │
-                   └─────────────────┘
+        │                                               │
+        └───────────────────────────────────────────────┘
+                    Shared Session Storage
 ```
 
-## Security
+## Support
 
-- Redis URL with password stored in AWS App Runner environment variables
-- TLS automatically enabled for Upstash connections
-- Password masked in logs
-- No VPC peering required (public endpoint with auth)
-
-## Cost
-
-Upstash offers:
-- Free tier: 10,000 commands/day
-- Pay-as-you-go: ~$0.20 per 100K commands
-- Pro tier: Fixed pricing for higher volumes
-
-For typical lab usage (~100 sessions/day), free tier is usually sufficient.
+- Upstash Docs: https://docs.upstash.com/redis
+- AWS App Runner Docs: https://docs.aws.amazon.com/apprunner

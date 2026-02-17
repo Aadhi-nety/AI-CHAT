@@ -20,13 +20,42 @@ export class RedisService {
 
   private initializeClient(): void {
     const redisUrl = process.env.REDIS_URL;
+    const isProduction = process.env.NODE_ENV === 'production';
 
     if (!redisUrl) {
-      const errorMsg = "[Redis] CRITICAL: REDIS_URL environment variable is not set. " +
-        "Please set REDIS_URL=redis://default:password@your-upstash-endpoint:6379";
+      const errorMsg = "[Redis] CRITICAL: REDIS_URL environment variable is not set.\n" +
+        "========================================\n" +
+        "AWS App Runner Configuration:\n" +
+        "1. Go to AWS App Runner Console\n" +
+        "2. Select your service\n" +
+        "3. Click 'Configuration' tab\n" +
+        "4. Under 'Environment variables', add:\n" +
+        "   Name: REDIS_URL\n" +
+        "   Value: redis://default:password@your-upstash-endpoint:6379\n" +
+        "5. Click 'Save changes' and redeploy\n" +
+        "========================================\n" +
+        "Local Development:\n" +
+        "Create backend/.env file with:\n" +
+        "REDIS_URL=redis://default:password@your-upstash-endpoint:6379\n" +
+        "========================================";
       console.error(errorMsg);
-      throw new Error("REDIS_URL is required for production session storage");
+      
+      if (isProduction) {
+        throw new Error("REDIS_URL is required for production session storage. See logs above for setup instructions.");
+      } else {
+        console.warn("[Redis] Running in development mode without Redis - session storage will fail");
+        this.client = null;
+        return;
+      }
     }
+
+
+    // Validate URL format
+    if (!redisUrl.startsWith('redis://') && !redisUrl.startsWith('rediss://')) {
+      console.error("[Redis] Invalid REDIS_URL format. Must start with redis:// or rediss://");
+      throw new Error("Invalid REDIS_URL format");
+    }
+
 
     try {
       console.log(`[Redis] Initializing connection to Upstash Redis...`);
@@ -36,6 +65,12 @@ export class RedisService {
       const urlObj = new URL(redisUrl);
       const maskedUrl = `redis://${urlObj.username}:****@${urlObj.hostname}:${urlObj.port}`;
       console.log(`[Redis] Connecting to: ${maskedUrl}`);
+
+      // Determine if TLS should be enabled
+      // Upstash requires TLS, check for rediss:// or upstash in URL
+      const useTls = redisUrl.startsWith('rediss://') || redisUrl.includes('upstash.io');
+      
+      console.log(`[Redis] TLS enabled: ${useTls}`);
 
       this.client = new Redis(redisUrl, {
         retryStrategy: (times: number) => {
@@ -51,18 +86,30 @@ export class RedisService {
         },
         maxRetriesPerRequest: 3,
         enableReadyCheck: true,
-        // Upstash specific settings
-        tls: redisUrl.includes('upstash') ? {} : undefined, // Enable TLS for Upstash
+        // TLS settings for Upstash
+        tls: useTls ? {
+          rejectUnauthorized: true, // Verify certificate
+        } : undefined,
         connectTimeout: 10000, // 10 second connection timeout
         commandTimeout: 5000, // 5 second command timeout
+        // Additional options for Upstash compatibility
+        family: 4, // Use IPv4
+        keepAlive: 30000, // Keep connection alive
       });
+
 
       this.setupEventHandlers();
     } catch (error) {
       console.error("[Redis] Failed to initialize client:", error);
-      throw error; // Fail fast in production - no in-memory fallback
+      if (isProduction) {
+        throw error; // Fail fast in production
+      } else {
+        console.warn("[Redis] Initialization failed in development mode - continuing without Redis");
+        this.client = null;
+      }
     }
   }
+
 
 
   private setupEventHandlers(): void {

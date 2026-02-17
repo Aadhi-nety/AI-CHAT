@@ -3,7 +3,9 @@
  * Tests: Redis connection, session operations, WebSocket flow
  */
 
+require('dotenv').config();
 const Redis = require('ioredis');
+
 
 // Test configuration
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
