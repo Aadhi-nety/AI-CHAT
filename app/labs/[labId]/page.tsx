@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { AlertCircle, Loader2, X, Copy, Check } from "lucide-react";
-import { useTerminal } from "@/hooks/use-terminal";
+import { useTerminalHttp } from "@/hooks/use-terminal-http";
 import { apiClient } from "@/lib/api-client";
 
 interface TerminalOutput {
@@ -103,11 +103,11 @@ export default function LabPage() {
 
   const outputRef = useRef<HTMLDivElement>(null);
   
-  // Generate WebSocket URL using the apiClient helper for proper protocol handling
-  // This ensures correct URL in both development and production
-  const webSocketUrl = sessionId ? apiClient.getTerminalUrl(sessionId) : "";
+  // Get API base URL for HTTP requests
+  // This works with AWS App Runner which doesn't support WebSocket
+  const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || "";
   
-  const { isConnected, executeCommand } = useTerminal(webSocketUrl, {
+  const { isConnected, executeCommand } = useTerminalHttp(apiBaseUrl, sessionId, {
     onMessage: (msg) => {
       if (msg.type === "connected") {
         addOutput("system", msg.message || "Connected to terminal");

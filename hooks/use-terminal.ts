@@ -194,7 +194,7 @@ export function useTerminal(
           errorMessage = "Mixed content error: Cannot connect to secure WebSocket from HTTP page.";
           errorCode = "MIXED_CONTENT";
         } else if (webSocketUrl.includes("awsapprunner.com")) {
-          errorMessage = "AWS App Runner WebSocket connection failed. This may be due to: 1) Service still starting, 2) Session not found, 3) Network issues. Please try again in a few moments.";
+          errorMessage = "AWS App Runner WebSocket connection failed. This may be due to: 1) Service still starting, 2) Session not found, 3) Network/proxy issues. Please try again in a few moments.";
           errorCode = "AWS_APP_RUNNER_ERROR";
         }
         
@@ -239,6 +239,7 @@ export function useTerminal(
         const isServerError = event.code >= 4500;
         const isConnectionTimeout = event.code === 1008;
         const isAbnormalClosure = event.code === 1006;
+        const isGoingAway = event.code === 1001;
         
         if (isInvalidSession) {
           console.error("[Terminal] Invalid session - will not retry");
@@ -273,16 +274,33 @@ export function useTerminal(
         }
 
         if (isAbnormalClosure) {
-          console.error("[Terminal] Abnormal closure - possible network or proxy issue");
-          // This is often a proxy/firewall issue, still try to reconnect
+          console.error("[Terminal] Abnormal closure (1006) - possible network, proxy, or AWS load balancer issue");
+          // 1006 is often caused by:
+          // 1. AWS App Runner load balancer closing idle connections
+          // 2. Proxy/firewall interference
+          // 3. Socket timeout on server side
+          // Still try to reconnect with shorter delay
+        }
+
+        if (isGoingAway) {
+          console.log("[Terminal] Server is going away (page refresh/navigation)");
+          // Don't show error for normal navigation
+          return;
         }
 
         // Attempt to reconnect if not a normal closure and under max attempts
-        if (event.code !== 1000 && !isServerError && !isConnectionTimeout && reconnectAttemptsRef.current < maxReconnectAttempts) {
+        const shouldRetry = event.code !== 1000 && event.code !== 1001 && !isServerError && !isConnectionTimeout && !isInvalidSession;
+        
+        if (shouldRetry && reconnectAttemptsRef.current < maxReconnectAttempts) {
           reconnectAttemptsRef.current++;
           // Exponential backoff: base delay * 2^(attempt - 1)
-          const backoffDelay = reconnectDelay * Math.pow(2, reconnectAttemptsRef.current - 1);
-          console.log(`[Terminal] Reconnecting in ${backoffDelay}ms (attempt ${reconnectAttemptsRef.current}/${maxReconnectAttempts})`);
+          // Use shorter delay for 1006 errors (AWS App Runner specific)
+          const isAbnormalClosure = event.code === 1006;
+          const baseDelay = isAbnormalClosure ? 1000 : reconnectDelay;
+          const backoffDelay = baseDelay * Math.pow(2, reconnectAttemptsRef.current - 1);
+          const finalDelay = Math.min(backoffDelay, 30000); // Cap at 30 seconds
+          
+          console.log(`[Terminal] Reconnecting in ${finalDelay}ms (attempt ${reconnectAttemptsRef.current}/${maxReconnectAttempts})`);
           setDiagnostics(prev => ({
             ...prev,
             attempts: reconnectAttemptsRef.current,
@@ -291,7 +309,7 @@ export function useTerminal(
           }));
           reconnectTimeoutRef.current = setTimeout(() => {
             connect();
-          }, backoffDelay);
+          }, finalDelay);
         } else if (reconnectAttemptsRef.current >= maxReconnectAttempts || isServerError) {
           console.error("[Terminal] Max reconnection attempts reached or server error");
           const errorMessage = isServerError 

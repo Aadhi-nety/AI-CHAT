@@ -19,6 +19,7 @@ import { WebSocket, Server as WebSocketServer } from "ws";
 import http from "http";
 import labSessionService from "./services/lab-session.service";
 import { TerminalServer } from "./terminal-server";
+import websocketRoutes from "./routes/websocket.routes";
 
 dotenv.config();
 
@@ -68,6 +69,9 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 app.use(express.json());
 
+// Mount WebSocket routes (HTTP polling - /api/ws/message, /api/ws/status, etc.)
+app.use("/api/ws", websocketRoutes);
+
 // Initialize terminal server
 const terminalServer = new TerminalServer();
 
@@ -79,6 +83,9 @@ const WS_CONNECTION_TIMEOUT = 30000;
 
 // Heartbeat interval (30 seconds)
 const HEARTBEAT_INTERVAL = 30000;
+
+// Socket timeout for upgrade (10 seconds)
+const SOCKET_TIMEOUT = 10000;
 
 // Health check endpoint for AWS App Runner
 app.get("/health", (req, res) => {
@@ -286,6 +293,14 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionId: strin
   let heartbeatInterval: NodeJS.Timeout | null = null;
   let isAlive = true;
   
+  // Set connection timeout
+  const connectionTimeout = setTimeout(() => {
+    console.error(`[WebSocket:${sessionId}] Connection timeout - no activity`);
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.close(1008, "Connection timeout");
+    }
+  }, WS_CONNECTION_TIMEOUT);
+  
   // Heartbeat ping every 30 seconds
   heartbeatInterval = setInterval(() => {
     if (!isAlive) {
@@ -313,6 +328,9 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionId: strin
       const message = JSON.parse(data.toString());
       console.log(`[WebSocket:${sessionId}] Received:`, message);
       
+      // Reset connection timeout on any message
+      clearTimeout(connectionTimeout);
+      
       // Handle client ping
       if (message.type === "ping") {
         ws.send(JSON.stringify({ type: "pong", timestamp: Date.now() }));
@@ -324,17 +342,20 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionId: strin
       
     } catch (error) {
       console.error(`[WebSocket:${sessionId}] Error handling message:`, error);
-      ws.send(JSON.stringify({
-        type: "error",
-        message: "Invalid message format",
-        timestamp: Date.now()
-      }));
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "error",
+          message: "Invalid message format",
+          timestamp: Date.now()
+        }));
+      }
     }
   });
   
   // Handle close
   ws.on("close", (code: number, reason: Buffer) => {
     console.log(`[WebSocket:${sessionId}] Connection closed: ${code} ${reason.toString()}`);
+    clearTimeout(connectionTimeout);
     if (heartbeatInterval) {
       clearInterval(heartbeatInterval);
     }
@@ -343,20 +364,24 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionId: strin
   // Handle errors
   ws.on("error", (error: Error) => {
     console.error(`[WebSocket:${sessionId}] Error:`, error);
+    clearTimeout(connectionTimeout);
     if (heartbeatInterval) {
       clearInterval(heartbeatInterval);
     }
   });
   
-  // Send initial connection message
-  ws.send(JSON.stringify({
-    type: "connected",
-    message: "WebSocket connection established",
-    sessionId: sessionId,
-    timestamp: Date.now()
-  }));
-  
-  console.log(`[WebSocket:${sessionId}] Connection setup complete in ${Date.now() - startTime}ms`);
+  // Send initial connection message with delay to ensure socket is ready
+  setTimeout(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "connected",
+        message: "WebSocket connection established",
+        sessionId: sessionId,
+        timestamp: Date.now()
+      }));
+      console.log(`[WebSocket:${sessionId}] Connection setup complete in ${Date.now() - startTime}ms`);
+    }
+  }, 100);
 });
 
 // Handle HTTP upgrade for WebSocket
@@ -366,6 +391,27 @@ server.on("upgrade", async (request: http.IncomingMessage, socket: any, head: Bu
   console.log(`[Upgrade] Request for: ${pathname}`);
   console.log(`[Upgrade] Headers:`, JSON.stringify(request.headers, null, 2));
   
+  // Set socket timeout to prevent hanging connections
+  socket.setTimeout(SOCKET_TIMEOUT);
+  socket.on("timeout", () => {
+    console.error(`[Upgrade] Socket timeout for ${pathname}`);
+    socket.destroy();
+  });
+  
+  // Handle socket errors
+  socket.on("error", (err: Error) => {
+    console.error(`[Upgrade] Socket error for ${pathname}:`, err.message);
+    socket.destroy();
+  });
+  
+  // Check for AWS App Runner forwarded protocol
+  const forwardedProto = request.headers["x-forwarded-proto"];
+  const isSecure = forwardedProto === "https" || request.headers["x-forwarded-proto"] === "https";
+  
+  if (forwardedProto) {
+    console.log(`[Upgrade] X-Forwarded-Proto: ${forwardedProto}, secure: ${isSecure}`);
+  }
+  
   // Parse session ID from URL
   // URL format: /terminal/:sessionId or /ws-test
   const terminalMatch = pathname.match(/^\/terminal\/(.+)$/);
@@ -373,6 +419,7 @@ server.on("upgrade", async (request: http.IncomingMessage, socket: any, head: Bu
   
   if (!terminalMatch && !isTestEndpoint) {
     console.log(`[Upgrade] Invalid path: ${pathname}`);
+    socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
     socket.destroy();
     return;
   }
@@ -386,7 +433,7 @@ server.on("upgrade", async (request: http.IncomingMessage, socket: any, head: Bu
       
       if (!session) {
         console.log(`[Upgrade] Session not found: ${sessionId}`);
-        socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+        socket.write("HTTP/1.1 400 Bad Request\r\n\r\nSession not found or expired\r\n");
         socket.destroy();
         return;
       }
@@ -400,11 +447,16 @@ server.on("upgrade", async (request: http.IncomingMessage, socket: any, head: Bu
     }
   }
   
-  // Complete the upgrade
-  wss.handleUpgrade(request, socket, head, (ws) => {
-    console.log(`[Upgrade] WebSocket upgrade successful for: ${sessionId}`);
-    wss.emit("connection", ws, request, sessionId);
-  });
+  // Complete the upgrade with error handling
+  try {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      console.log(`[Upgrade] WebSocket upgrade successful for: ${sessionId}`);
+      wss.emit("connection", ws, request, sessionId);
+    });
+  } catch (error) {
+    console.error(`[Upgrade] WebSocket upgrade failed for ${sessionId}:`, error);
+    socket.destroy();
+  }
 });
 
 // Start server
