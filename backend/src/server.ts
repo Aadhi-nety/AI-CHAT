@@ -17,6 +17,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { WebSocket, Server as WebSocketServer } from "ws";
 import http from "http";
+import { exec } from "child_process";
 import labSessionService from "./services/lab-session.service";
 import { TerminalServer } from "./terminal-server";
 import websocketRoutes from "./routes/websocket.routes";
@@ -470,6 +471,15 @@ server.listen(PORT, () => {
   console.log(`  - ws://localhost:${PORT}/ws-test (test endpoint)`);
   console.log(`[Server] Connection timeout: ${WS_CONNECTION_TIMEOUT}ms`);
   console.log(`[Server] Heartbeat interval: ${HEARTBEAT_INTERVAL}ms`);
+
+  // Check AWS CLI availability in the runtime and log for diagnostics
+  exec('aws --version', (err, stdout, stderr) => {
+    if (err) {
+      console.warn('[Server] AWS CLI not found in runtime (aws --version failed):', err.message);
+    } else {
+      console.log('[Server] AWS CLI available:', stdout || stderr);
+    }
+  });
 });
 
 // Graceful shutdown

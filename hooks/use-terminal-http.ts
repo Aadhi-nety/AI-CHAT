@@ -125,6 +125,9 @@ export function useTerminalHttp(
       return;
     }
 
+    // Track connect start to compute a meaningful connection duration
+    const connectStart = Date.now();
+
     setIsConnecting(true);
     setError(null);
 
@@ -140,7 +143,7 @@ export function useTerminalHttp(
 
       await Promise.race([statusPromise, timeoutPromise]);
 
-      const connectionTime = Date.now();
+      const connectionTime = Date.now() - connectStart;
       console.log(`[Terminal HTTP] Connected in ${connectionTime}ms`);
 
       setIsConnected(true);
