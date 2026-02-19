@@ -21,32 +21,30 @@ export class TerminalInstance {
   }
 
   /**
+   * Check if credentials are temporary/mock credentials (created at lab start)
+   */
+  private isTemporaryCredential(): boolean {
+    // Temporary credentials created by AWSControlTowerService for labs
+    return (
+      this.credentials.accessKeyId === "DEVKEY" ||
+      this.credentials.accessKeyId?.startsWith("AKIA") === false // Real AWS keys start with AKIA
+    );
+  }
+
+  /**
    * Validate AWS credentials by calling sts:GetCallerIdentity
+   * Skip validation for temporary/mock credentials from lab sandbox creation
    */
   private async validateCredentials(): Promise<{ valid: boolean; error?: string }> {
+    // Skip validation for temporary credentials created at lab start
+    if (this.isTemporaryCredential()) {
+      console.log(
+        `[Terminal:${this.sessionId}] ✓ Using temporary lab credentials (validation skipped)`
+      );
+      return { valid: true };
+    }
+
     try {
-      // Check for required credential fields
-      if (!this.credentials.accessKeyId) {
-        return {
-          valid: false,
-          error: "AWS Access Key ID is missing. Please provide valid credentials.",
-        };
-      }
-
-      if (!this.credentials.secretAccessKey) {
-        return {
-          valid: false,
-          error: "AWS Secret Access Key is missing. Please provide valid credentials.",
-        };
-      }
-
-      if (!this.credentials.region) {
-        return {
-          valid: false,
-          error: "AWS Region is missing. Please provide a valid region.",
-        };
-      }
-
       const sts = new AWS.STS({
         accessKeyId: this.credentials.accessKeyId,
         secretAccessKey: this.credentials.secretAccessKey,
@@ -56,9 +54,9 @@ export class TerminalInstance {
       // Log masked credentials for debugging
       const maskedKey = this.credentials.accessKeyId
         ? this.credentials.accessKeyId.substring(0, 4) +
-          "*".repeat(Math.max(0, this.credentials.accessKeyId.length - 8)) +
+          "*".repeat(this.credentials.accessKeyId.length - 8) +
           this.credentials.accessKeyId.substring(
-            Math.max(0, this.credentials.accessKeyId.length - 4)
+            this.credentials.accessKeyId.length - 4
           )
         : "undefined";
 
@@ -132,6 +130,7 @@ export class TerminalInstance {
           AWS_DEFAULT_REGION: this.credentials.region,
           AWS_REGION: this.credentials.region,
         };
+        // to prevent interference from parent process credentials
 
         // Parse command
         const [cmd, ...args] = command.trim().split(/\s+/);
@@ -150,16 +149,7 @@ export class TerminalInstance {
         if (cmd === 'aws') {
           (async () => {
             try {
-              const awsCredentials = {
-                accessKeyId: this.credentials.accessKeyId,
-                secretAccessKey: this.credentials.secretAccessKey,
-                region: this.credentials.region,
-              };
-
-              const service = args[0];
-              const action = args[1];
-
-              // Validate credentials only on first AWS command (lazy validation)
+              // Validate credentials on first AWS command
               if (!this.credentialsValidated) {
                 const validationResult = await this.validateCredentials();
                 if (!validationResult.valid) {
@@ -178,30 +168,27 @@ export class TerminalInstance {
                 }
                 this.credentialsValidated = true;
               }
+              const awsCredentials = {
+                accessKeyId: this.credentials.accessKeyId,
+                secretAccessKey: this.credentials.secretAccessKey,
+                region: this.credentials.region,
+              };
+
+              const service = args[0];
+              const action = args[1];
 
               // Handle SSM commands commonly used by labs
               if (service === 'ssm' && action === 'describe-instance-information') {
                 const ssm = new AWS.SSM(awsCredentials);
-                try {
-                  const res = await ssm.describeInstanceInformation({ MaxResults: 10 }).promise();
-                  const output = {
-                    command,
-                    exitCode: 0,
-                    stdout: JSON.stringify(res, null, 2),
-                    stderr: '',
-                    timestamp: Date.now(),
-                  };
-                  resolve(JSON.stringify(output, null, 2));
-                } catch (err: any) {
-                  const output = {
-                    command,
-                    exitCode: 2,
-                    stdout: '',
-                    stderr: this.getErrorMessage(err),
-                    timestamp: Date.now(),
-                  };
-                  resolve(JSON.stringify(output, null, 2));
-                }
+                const res = await ssm.describeInstanceInformation().promise();
+                const output = {
+                  command,
+                  exitCode: 0,
+                  stdout: JSON.stringify(res, null, 2),
+                  stderr: '',
+                  timestamp: Date.now(),
+                };
+                resolve(JSON.stringify(output, null, 2));
                 return;
               }
 
@@ -223,29 +210,18 @@ export class TerminalInstance {
                   });
                 }
 
-                const params: any = { MaxResults: 10 };
+                const params: any = {};
                 if (filters) params.Filters = filters;
 
-                try {
-                  const res = await ssm.describeSessions(params).promise();
-                  const output = {
-                    command,
-                    exitCode: 0,
-                    stdout: JSON.stringify(res, null, 2),
-                    stderr: '',
-                    timestamp: Date.now(),
-                  };
-                  resolve(JSON.stringify(output, null, 2));
-                } catch (err: any) {
-                  const output = {
-                    command,
-                    exitCode: 2,
-                    stdout: '',
-                    stderr: this.getErrorMessage(err),
-                    timestamp: Date.now(),
-                  };
-                  resolve(JSON.stringify(output, null, 2));
-                }
+                const res = await ssm.describeSessions(params).promise();
+                const output = {
+                  command,
+                  exitCode: 0,
+                  stdout: JSON.stringify(res, null, 2),
+                  stderr: '',
+                  timestamp: Date.now(),
+                };
+                resolve(JSON.stringify(output, null, 2));
                 return;
               }
 
@@ -280,26 +256,15 @@ export class TerminalInstance {
                 const s3 = new AWS.S3(awsCredentials);
                 // `aws s3 ls` with no further args lists buckets
                 if (args.length === 2) {
-                  try {
-                    const res = await s3.listBuckets().promise();
-                    const output = {
-                      command,
-                      exitCode: 0,
-                      stdout: JSON.stringify(res, null, 2),
-                      stderr: '',
-                      timestamp: Date.now(),
-                    };
-                    resolve(JSON.stringify(output, null, 2));
-                  } catch (err: any) {
-                    const output = {
-                      command,
-                      exitCode: 2,
-                      stdout: '',
-                      stderr: this.getErrorMessage(err),
-                      timestamp: Date.now(),
-                    };
-                    resolve(JSON.stringify(output, null, 2));
-                  }
+                  const res = await s3.listBuckets().promise();
+                  const output = {
+                    command,
+                    exitCode: 0,
+                    stdout: JSON.stringify(res, null, 2),
+                    stderr: '',
+                    timestamp: Date.now(),
+                  };
+                  resolve(JSON.stringify(output, null, 2));
                   return;
                 }
 
@@ -307,26 +272,15 @@ export class TerminalInstance {
                 const target = args[1] || '';
                 if (target.startsWith('s3://')) {
                   const bucket = target.replace('s3://', '').replace(/\/.*/,'');
-                  try {
-                    const res = await s3.listObjectsV2({ Bucket: bucket }).promise();
-                    const output = {
-                      command,
-                      exitCode: 0,
-                      stdout: JSON.stringify(res, null, 2),
-                      stderr: '',
-                      timestamp: Date.now(),
-                    };
-                    resolve(JSON.stringify(output, null, 2));
-                  } catch (err: any) {
-                    const output = {
-                      command,
-                      exitCode: 2,
-                      stdout: '',
-                      stderr: this.getErrorMessage(err),
-                      timestamp: Date.now(),
-                    };
-                    resolve(JSON.stringify(output, null, 2));
-                  }
+                  const res = await s3.listObjectsV2({ Bucket: bucket }).promise();
+                  const output = {
+                    command,
+                    exitCode: 0,
+                    stdout: JSON.stringify(res, null, 2),
+                    stderr: '',
+                    timestamp: Date.now(),
+                  };
+                  resolve(JSON.stringify(output, null, 2));
                   return;
                 }
               }
@@ -526,14 +480,9 @@ export class TerminalInstance {
               // Organizations: list-accounts
               if (service === 'organizations' && action === 'list-accounts') {
                 const org = new AWS.Organizations(awsCredentials);
-                try {
-                  const res = await org.listAccounts().promise();
-                  const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
-                  resolve(JSON.stringify(output, null, 2));
-                } catch (err: any) {
-                  const output = { command, exitCode: 2, stdout: '', stderr: this.getErrorMessage(err), timestamp: Date.now() };
-                  resolve(JSON.stringify(output, null, 2));
-                }
+                const res = await org.listAccounts().promise();
+                const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                resolve(JSON.stringify(output, null, 2));
                 return;
               }
 
@@ -543,7 +492,7 @@ export class TerminalInstance {
 
                 if (action === 'list-tables') {
                   try {
-                    const res = await dynamodb.listTables({ Limit: 10 }).promise();
+                    const res = await dynamodb.listTables().promise();
                     const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
                     resolve(JSON.stringify(output, null, 2));
                   } catch (err: any) {
@@ -596,7 +545,7 @@ export class TerminalInstance {
 
                 if (action === 'list-functions') {
                   try {
-                    const res = await lambda.listFunctions({ MaxItems: 10 }).promise();
+                    const res = await lambda.listFunctions().promise();
                     const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
                     resolve(JSON.stringify(output, null, 2));
                   } catch (err: any) {
@@ -644,7 +593,7 @@ export class TerminalInstance {
 
                 if (action === 'list-layers') {
                   try {
-                    const res = await lambda.listLayers({ MaxItems: 10 }).promise();
+                    const res = await lambda.listLayers().promise();
                     const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
                     resolve(JSON.stringify(output, null, 2));
                   } catch (err: any) {
@@ -661,7 +610,7 @@ export class TerminalInstance {
 
                 if (action === 'lookup-events') {
                   try {
-                    const res = await cloudtrail.lookupEvents({ MaxResults: 10 }).promise();
+                    const res = await cloudtrail.lookupEvents({}).promise();
                     const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
                     resolve(JSON.stringify(output, null, 2));
                   } catch (err: any) {
@@ -708,7 +657,7 @@ export class TerminalInstance {
 
                 if (action === 'list-command-invocations') {
                   try {
-                    const res = await ssm.listCommandInvocations({ MaxResults: 10 }).promise();
+                    const res = await ssm.listCommandInvocations({}).promise();
                     const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
                     resolve(JSON.stringify(output, null, 2));
                   } catch (err: any) {
