@@ -34,11 +34,14 @@ export function useTerminalHttp(
   sessionId: string,
   options: UseTerminalHttpOptions = {}
 ) {
+  // Normalize API base URL early to avoid accidental trailing spaces or slashes
+  const baseApiUrl = apiBaseUrl ? apiBaseUrl.trim().replace(/\s+$/u, '').replace(/\/+$/u, '') : apiBaseUrl;
+
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [diagnostics, setDiagnostics] = useState<ConnectionDiagnostics>({
-    url: apiBaseUrl,
+    url: baseApiUrl || apiBaseUrl,
     attempts: 0,
   });
 
@@ -58,7 +61,8 @@ export function useTerminalHttp(
     endpoint: string,
     options: RequestInit = {}
   ): Promise<any> => {
-    const url = `${apiBaseUrl}${endpoint}`;
+    const base = baseApiUrl || apiBaseUrl || '';
+    const url = `${base}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
     
     try {
       const response = await fetch(url, {
