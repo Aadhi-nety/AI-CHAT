@@ -90,6 +90,9 @@ export class AWSControlTowerService {
       const accountId = Math.random().toString().slice(2, 14);
 
       // Create IAM user for the lab in the sandbox account
+      console.log(
+        `[AWSControlTower] Creating IAM user for lab-${labId}, user ${userId}`
+      );
       const iamUser = await this.createLabIAMUser(accountId, userId, labId);
 
       const sandbox: SandboxAccount = {
@@ -110,7 +113,16 @@ export class AWSControlTowerService {
       return sandbox;
     } catch (error) {
       console.error("[AWSControlTower] Failed to create sandbox account:", error);
-      throw new Error("Failed to create sandbox account");
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      // Check for credential issues
+      if (errorMessage?.includes("security token") || errorMessage?.includes("InvalidClientTokenId")) {
+        throw new Error(
+          "AWS credentials configured on backend are invalid. Please verify AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables."
+        );
+      }
+
+      throw new Error(`Failed to create sandbox account: ${errorMessage}`);
     }
   }
 
@@ -170,15 +182,66 @@ export class AWSControlTowerService {
 
       const accessKey = accessKeyResponse.AccessKey;
 
+      if (!accessKey?.AccessKeyId || !accessKey?.SecretAccessKey) {
+        throw new Error("Failed to create access key - keys were not returned from AWS");
+      }
+
+      // Validate the created access key by attempting to use it
+      console.log(`[AWSControlTower] Validating created access keys for user: ${userName}`);
+      await this.validateAccessKey(
+        accessKey.AccessKeyId,
+        accessKey.SecretAccessKey
+      );
+
       return {
         iamUserId: userId_response,
         userName,
-        accessKeyId: accessKey?.AccessKeyId || "",
-        secretAccessKey: accessKey?.SecretAccessKey || "",
+        accessKeyId: accessKey.AccessKeyId,
+        secretAccessKey: accessKey.SecretAccessKey,
       };
     } catch (error) {
       console.error("[AWSControlTower] Failed to create IAM user:", error);
-      throw new Error("Failed to create IAM user");
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to create IAM user: ${errorMessage}`);
+    }
+  }
+
+  /**
+   * Validate that access keys are actually working
+   */
+  private async validateAccessKey(
+    accessKeyId: string,
+    secretAccessKey: string
+  ): Promise<void> {
+    try {
+      const sts = new AWS.STS({
+        accessKeyId,
+        secretAccessKey,
+        region: this.region,
+      });
+
+      console.log("[AWSControlTower] Testing access key with STS GetCallerIdentity...");
+      const result = await sts.getCallerIdentity().promise();
+      console.log(
+        `[AWSControlTower] Access key validated. Account: ${result.Account}, UserId: ${result.UserId}`
+      );
+    } catch (error: any) {
+      const errorMessage = error?.message || String(error);
+      console.error(
+        "[AWSControlTower] Access key validation failed:",
+        errorMessage
+      );
+
+      if (
+        errorMessage?.includes("security token") ||
+        errorMessage?.includes("InvalidClientTokenId")
+      ) {
+        throw new Error(
+          "Created access key is invalid. The AWS credentials are not working properly."
+        );
+      }
+
+      throw new Error(`Access key validation failed: ${errorMessage}`);
     }
   }
 

@@ -13,10 +13,79 @@ export class TerminalInstance {
   private credentials: AWSCredentials;
   private commandHistory: string[] = [];
   private isExecuting = false;
+  private credentialsValidated = false;
 
   constructor(sessionId: string, credentials: AWSCredentials) {
     this.sessionId = sessionId;
     this.credentials = credentials;
+  }
+
+  /**
+   * Validate AWS credentials by calling sts:GetCallerIdentity
+   */
+  private async validateCredentials(): Promise<{ valid: boolean; error?: string }> {
+    try {
+      const sts = new AWS.STS({
+        accessKeyId: this.credentials.accessKeyId,
+        secretAccessKey: this.credentials.secretAccessKey,
+        region: this.credentials.region,
+      });
+
+      // Log masked credentials for debugging
+      const maskedKey = this.credentials.accessKeyId
+        ? this.credentials.accessKeyId.substring(0, 4) +
+          "*".repeat(this.credentials.accessKeyId.length - 8) +
+          this.credentials.accessKeyId.substring(
+            this.credentials.accessKeyId.length - 4
+          )
+        : "undefined";
+
+      console.log(
+        `[Terminal:${this.sessionId}] Validating AWS credentials... (Key: ${maskedKey}, Region: ${this.credentials.region})`
+      );
+
+      // Validate credentials by calling get-caller-identity
+      const result = await sts.getCallerIdentity().promise();
+
+      console.log(
+        `[Terminal:${this.sessionId}] ✓ Credentials valid. Account: ${result.Account}, UserId: ${result.UserId}, ARN: ${result.Arn}`
+      );
+
+      return { valid: true };
+    } catch (error: any) {
+      const errorMessage = error?.message || String(error);
+      const errorCode = error?.code || "UnknownError";
+
+      console.error(
+        `[Terminal:${this.sessionId}] ✗ Credential validation failed (${errorCode}): ${errorMessage}`
+      );
+
+      const isInvalidToken =
+        errorMessage?.includes("security token") ||
+        errorMessage?.includes("invalid") ||
+        errorMessage?.includes("NotAuthorized") ||
+        errorCode === "InvalidClientTokenId" ||
+        errorCode === "SignatureDoesNotMatch";
+
+      if (isInvalidToken) {
+        console.error(
+          `[Terminal:${this.sessionId}] This is a credential authentication error - the keys provided are not valid AWS credentials`
+        );
+        return {
+          valid: false,
+          error: "AWS credentials are invalid or expired. Please verify your access key ID and secret access key.",
+        };
+      }
+
+      console.error(
+        `[Terminal:${this.sessionId}] Other validation error:`,
+        error
+      );
+      return {
+        valid: false,
+        error: `Credential validation failed: ${errorMessage}`,
+      };
+    }
   }
 
   /**
@@ -46,12 +115,38 @@ export class TerminalInstance {
         const [cmd, ...args] = command.trim().split(/\s+/);
 
         console.log(`[Terminal:${this.sessionId}] Executing: ${command}`);
+        console.log(
+          `[Terminal:${this.sessionId}] Environment: Region=${this.credentials.region}, KeyId=${
+            this.credentials.accessKeyId
+              ? this.credentials.accessKeyId.substring(0, 4) + "****"
+              : "undefined"
+          }`
+        );
 
         // If user invoked the `aws` CLI but the binary is not available in the image,
         // handle common AWS calls via the AWS SDK so the terminal still works.
         if (cmd === 'aws') {
           (async () => {
             try {
+              // Validate credentials on first AWS command
+              if (!this.credentialsValidated) {
+                const validationResult = await this.validateCredentials();
+                if (!validationResult.valid) {
+                  const output = {
+                    command,
+                    exitCode: 2,
+                    stdout: "",
+                    stderr:
+                      validationResult.error ||
+                      "Failed to validate AWS credentials",
+                    timestamp: Date.now(),
+                  };
+                  this.isExecuting = false;
+                  resolve(JSON.stringify(output, null, 2));
+                  return;
+                }
+                this.credentialsValidated = true;
+              }
               const awsCredentials = {
                 accessKeyId: this.credentials.accessKeyId,
                 secretAccessKey: this.credentials.secretAccessKey,
@@ -112,15 +207,26 @@ export class TerminalInstance {
               // STS: get-caller-identity
               if (service === 'sts' && action === 'get-caller-identity') {
                 const sts = new AWS.STS(awsCredentials);
-                const res = await sts.getCallerIdentity().promise();
-                const output = {
-                  command,
-                  exitCode: 0,
-                  stdout: JSON.stringify(res, null, 2),
-                  stderr: '',
-                  timestamp: Date.now(),
-                };
-                resolve(JSON.stringify(output, null, 2));
+                try {
+                  const res = await sts.getCallerIdentity().promise();
+                  const output = {
+                    command,
+                    exitCode: 0,
+                    stdout: JSON.stringify(res, null, 2),
+                    stderr: '',
+                    timestamp: Date.now(),
+                  };
+                  resolve(JSON.stringify(output, null, 2));
+                } catch (err: any) {
+                  const output = {
+                    command,
+                    exitCode: 2,
+                    stdout: '',
+                    stderr: this.getErrorMessage(err),
+                    timestamp: Date.now(),
+                  };
+                  resolve(JSON.stringify(output, null, 2));
+                }
                 return;
               }
 
@@ -176,15 +282,26 @@ export class TerminalInstance {
               // EC2: describe-instances
               if (service === 'ec2' && action === 'describe-instances') {
                 const ec2 = new AWS.EC2(awsCredentials);
-                const res = await ec2.describeInstances().promise();
-                const output = {
-                  command,
-                  exitCode: 0,
-                  stdout: JSON.stringify(res, null, 2),
-                  stderr: '',
-                  timestamp: Date.now(),
-                };
-                resolve(JSON.stringify(output, null, 2));
+                try {
+                  const res = await ec2.describeInstances().promise();
+                  const output = {
+                    command,
+                    exitCode: 0,
+                    stdout: JSON.stringify(res, null, 2),
+                    stderr: '',
+                    timestamp: Date.now(),
+                  };
+                  resolve(JSON.stringify(output, null, 2));
+                } catch (err: any) {
+                  const output = {
+                    command,
+                    exitCode: 2,
+                    stdout: '',
+                    stderr: this.getErrorMessage(err),
+                    timestamp: Date.now(),
+                  };
+                  resolve(JSON.stringify(output, null, 2));
+                }
                 return;
               }
 
@@ -193,9 +310,26 @@ export class TerminalInstance {
                 const iam = new AWS.IAM(awsCredentials);
 
                 if (action === 'list-users') {
-                  const res = await iam.listUsers().promise();
-                  const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
-                  resolve(JSON.stringify(output, null, 2));
+                  try {
+                    const res = await iam.listUsers().promise();
+                    const output = {
+                      command,
+                      exitCode: 0,
+                      stdout: JSON.stringify(res, null, 2),
+                      stderr: '',
+                      timestamp: Date.now(),
+                    };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = {
+                      command,
+                      exitCode: 2,
+                      stdout: '',
+                      stderr: this.getErrorMessage(err),
+                      timestamp: Date.now(),
+                    };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
                   return;
                 }
 
@@ -203,9 +337,20 @@ export class TerminalInstance {
                   // next arg may be --user-name or the username directly
                   let userName = args[1] || '';
                   if (userName === '--user-name') userName = args[2] || '';
-                  const res = await iam.getUser({ UserName: userName || undefined }).promise();
-                  const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
-                  resolve(JSON.stringify(output, null, 2));
+                  try {
+                    const res = await iam.getUser({ UserName: userName || undefined }).promise();
+                    const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = {
+                      command,
+                      exitCode: 2,
+                      stdout: '',
+                      stderr: this.getErrorMessage(err),
+                      timestamp: Date.now(),
+                    };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
                   return;
                 }
 
@@ -320,6 +465,207 @@ export class TerminalInstance {
                 return;
               }
 
+              // DynamoDB: table operations
+              if (service === 'dynamodb') {
+                const dynamodb = new AWS.DynamoDB(awsCredentials);
+
+                if (action === 'list-tables') {
+                  try {
+                    const res = await dynamodb.listTables().promise();
+                    const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = { command, exitCode: 2, stdout: '', stderr: this.getErrorMessage(err), timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
+                  return;
+                }
+
+                if (action === 'describe-table') {
+                  try {
+                    const tableName = args[args.indexOf('--table-name') + 1] || args[2];
+                    if (!tableName) {
+                      const output = { command, exitCode: 1, stdout: '', stderr: 'Error: --table-name is required', timestamp: Date.now() };
+                      resolve(JSON.stringify(output, null, 2));
+                      return;
+                    }
+                    const res = await dynamodb.describeTable({ TableName: tableName }).promise();
+                    const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = { command, exitCode: 2, stdout: '', stderr: this.getErrorMessage(err), timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
+                  return;
+                }
+
+                if (action === 'scan') {
+                  try {
+                    const tableName = args[args.indexOf('--table-name') + 1] || args[2];
+                    if (!tableName) {
+                      const output = { command, exitCode: 1, stdout: '', stderr: 'Error: --table-name is required', timestamp: Date.now() };
+                      resolve(JSON.stringify(output, null, 2));
+                      return;
+                    }
+                    const res = await dynamodb.scan({ TableName: tableName }).promise();
+                    const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = { command, exitCode: 2, stdout: '', stderr: this.getErrorMessage(err), timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
+                  return;
+                }
+              }
+
+              // Lambda: function operations
+              if (service === 'lambda') {
+                const lambda = new AWS.Lambda(awsCredentials);
+
+                if (action === 'list-functions') {
+                  try {
+                    const res = await lambda.listFunctions().promise();
+                    const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = { command, exitCode: 2, stdout: '', stderr: this.getErrorMessage(err), timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
+                  return;
+                }
+
+                if (action === 'get-function') {
+                  try {
+                    const functionName = args[args.indexOf('--function-name') + 1] || args[2];
+                    if (!functionName) {
+                      const output = { command, exitCode: 1, stdout: '', stderr: 'Error: --function-name is required', timestamp: Date.now() };
+                      resolve(JSON.stringify(output, null, 2));
+                      return;
+                    }
+                    const res = await lambda.getFunction({ FunctionName: functionName }).promise();
+                    const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = { command, exitCode: 2, stdout: '', stderr: this.getErrorMessage(err), timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
+                  return;
+                }
+
+                if (action === 'get-function-configuration') {
+                  try {
+                    const functionName = args[args.indexOf('--function-name') + 1] || args[2];
+                    if (!functionName) {
+                      const output = { command, exitCode: 1, stdout: '', stderr: 'Error: --function-name is required', timestamp: Date.now() };
+                      resolve(JSON.stringify(output, null, 2));
+                      return;
+                    }
+                    const res = await lambda.getFunctionConfiguration({ FunctionName: functionName }).promise();
+                    const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = { command, exitCode: 2, stdout: '', stderr: this.getErrorMessage(err), timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
+                  return;
+                }
+
+                if (action === 'list-layers') {
+                  try {
+                    const res = await lambda.listLayers().promise();
+                    const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = { command, exitCode: 2, stdout: '', stderr: this.getErrorMessage(err), timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
+                  return;
+                }
+              }
+
+              // CloudTrail: audit trail operations
+              if (service === 'cloudtrail') {
+                const cloudtrail = new AWS.CloudTrail(awsCredentials);
+
+                if (action === 'lookup-events') {
+                  try {
+                    const res = await cloudtrail.lookupEvents({}).promise();
+                    const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = { command, exitCode: 2, stdout: '', stderr: this.getErrorMessage(err), timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
+                  return;
+                }
+
+                if (action === 'describe-trails') {
+                  try {
+                    const res = await cloudtrail.describeTrails({}).promise();
+                    const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = { command, exitCode: 2, stdout: '', stderr: this.getErrorMessage(err), timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
+                  return;
+                }
+
+                if (action === 'get-trail-status') {
+                  try {
+                    const trailName = args[args.indexOf('--name') + 1] || args[2];
+                    if (!trailName) {
+                      const output = { command, exitCode: 1, stdout: '', stderr: 'Error: --name is required', timestamp: Date.now() };
+                      resolve(JSON.stringify(output, null, 2));
+                      return;
+                    }
+                    const res = await cloudtrail.getTrailStatus({ Name: trailName }).promise();
+                    const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = { command, exitCode: 2, stdout: '', stderr: this.getErrorMessage(err), timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
+                  return;
+                }
+              }
+
+              // SSM: additional operations beyond describe-instance-information and describe-sessions
+              if (service === 'ssm') {
+                const ssm = new AWS.SSM(awsCredentials);
+
+                if (action === 'list-command-invocations') {
+                  try {
+                    const res = await ssm.listCommandInvocations({}).promise();
+                    const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = { command, exitCode: 2, stdout: '', stderr: this.getErrorMessage(err), timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
+                  return;
+                }
+
+                if (action === 'get-command-invocation') {
+                  try {
+                    const commandId = args[args.indexOf('--command-id') + 1] || args[2];
+                    const instanceId = args[args.indexOf('--instance-id') + 1] || args[4];
+                    if (!commandId || !instanceId) {
+                      const output = { command, exitCode: 1, stdout: '', stderr: 'Error: --command-id and --instance-id are required', timestamp: Date.now() };
+                      resolve(JSON.stringify(output, null, 2));
+                      return;
+                    }
+                    const res = await ssm.getCommandInvocation({ CommandId: commandId, InstanceId: instanceId }).promise();
+                    const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  } catch (err: any) {
+                    const output = { command, exitCode: 2, stdout: '', stderr: this.getErrorMessage(err), timestamp: Date.now() };
+                    resolve(JSON.stringify(output, null, 2));
+                  }
+                  return;
+                }
+              }
+
               // Unsupported aws subcommand - return helpful error
               const output = {
                 command,
@@ -328,13 +674,23 @@ export class TerminalInstance {
                 stderr: `aws command '${service} ${action}' is not supported in this environment. Install AWS CLI in the image or use the backend SDK.`,
                 timestamp: Date.now(),
               };
+              console.log(
+                `[Terminal:${this.sessionId}] Command not supported: ${service} ${action}`
+              );
               resolve(JSON.stringify(output, null, 2));
             } catch (err: any) {
+              const errorMessage = err?.message ? err.message : String(err);
+              const errorCode = err?.code || "UnknownError";
+
+              console.error(
+                `[Terminal:${this.sessionId}] AWS SDK call failed (${errorCode}): ${errorMessage}`
+              );
+
               const output = {
                 command,
                 exitCode: 2,
                 stdout: '',
-                stderr: (err && err.message) ? err.message : String(err),
+                stderr: this.getErrorMessage(err),
                 timestamp: Date.now(),
               };
               resolve(JSON.stringify(output, null, 2));
@@ -392,6 +748,59 @@ export class TerminalInstance {
         reject(error);
       }
     });
+  }
+
+  /**
+   * Get helpful error message from AWS errors
+   */
+  private getErrorMessage(error: any): string {
+    if (!error) return "Unknown error";
+
+    const message = error?.message || String(error);
+    const code = error?.code || "";
+
+    // Map AWS error codes to helpful messages
+    if (
+      code === "InvalidClientTokenId" ||
+      message?.includes("security token")
+    ) {
+      return (
+        "Invalid AWS Access Key ID: The security token included in the request is invalid. " +
+        "Please verify your AWS access key ID and secret access key are correct. " +
+        "If you recently created the credentials, they may take a few minutes to become active."
+      );
+    }
+
+    if (code === "SignatureDoesNotMatch") {
+      return (
+        "Invalid AWS Secret Access Key: The request signature does not match. " +
+        "This usually means your AWS secret access key is incorrect. " +
+        "Please double-check the secret access key and try again."
+      );
+    }
+
+    if (code === "AccessDenied" || code === "UnauthorizedOperation") {
+      return (
+        `Access Denied: ${message}. ` +
+        "This user may not have permission for this operation. " +
+        "Please check the IAM user's permissions."
+      );
+    }
+
+    if (code === "InvalidParameterValue" || code === "InvalidParameterCombination") {
+      return `Invalid parameter: ${message}`;
+    }
+
+    if (code === "NoSuchEntity") {
+      return `Resource not found: ${message}. The IAM user or resource you're looking for does not exist.`;
+    }
+
+    if (code === "EntityAlreadyExists") {
+      return `Resource already exists: ${message}. You may need to use a different name or delete the existing resource first.`;
+    }
+
+    // Return original message if it's helpful, otherwise generic message
+    return message || "AWS API call failed";
   }
 
   /**
