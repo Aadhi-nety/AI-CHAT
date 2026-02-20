@@ -64,10 +64,9 @@ router.post('/message', async (req, res) => {
           let terminal = terminalServer.getTerminal(sessionId);
 
           if (!terminal) {
+            // Pass only region; AWS SDK will use IAM role credentials from environment
             terminal = terminalServer.createTerminal(sessionId, {
-              accessKeyId: session.sandboxAccount.iamAccessKeyId,
-              secretAccessKey: session.sandboxAccount.iamSecretAccessKey,
-              region: session.sandboxAccount.region || 'us-east-1'
+              region: session.sandboxAccount.region || process.env.AWS_REGION || 'us-east-1'
             });
           }
 

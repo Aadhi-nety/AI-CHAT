@@ -43,31 +43,28 @@ export class AWSControlTowerService {
    * Create a new sandbox AWS account
    */
   async createSandboxAccount(userId: string, labId: string, region: string = "ap-south-1"): Promise<SandboxAccount> {
-    // if AWS credentials are missing we either are running in local/dev or the service
-    // hasn't been configured properly.  In production we want to fail fast with a
-    // clear error; for local development we'll return a mock account so that the
-    // rest of the flow can be exercised without calling AWS.
-    if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
-      if (process.env.NODE_ENV === "production") {
-        console.error("[AWSControlTower] AWS credentials are not configured");
-        throw new Error("AWS credentials not configured on backend");
-      } else {
-        console.warn("[AWSControlTower] AWS credentials missing, using mock sandbox (dev mode)");
-        // return a minimal fake account so UI still works
-        return {
-          accountId: "000000000000",
-          accountName: `lab-${labId}-${userId}-dev`,
-          email: "dev@sandbox.local",
-          iamUserId: "dev-user",
-          iamUserName: "dev-user",
-          iamAccessKeyId: "DEVKEY",
-          iamSecretAccessKey: "DEVSECRET",
-          region: region,
-          createdAt: Date.now(),
-          expiresAt: Date.now() + 2 * 60 * 60 * 1000,
-          status: "active",
-        };
-      }
+    // In App Runner, AWS credentials are provided via IAM Instance Role
+    // For local development without IAM role, return mock account
+    const isProduction = process.env.NODE_ENV === "production";
+    const hasExplicitCredentials = process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY;
+    const hasIAMRole = process.env.AWS_ROLE_ARN || process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI;
+
+    if (!isProduction && !hasExplicitCredentials && !hasIAMRole) {
+      // Development mode without any credentials - return mock
+      console.warn("[AWSControlTower] No AWS credentials available (dev mode), using mock sandbox");
+      return {
+        accountId: "000000000000",
+        accountName: `lab-${labId}-${userId}-dev`,
+        email: "dev@sandbox.local",
+        iamUserId: "dev-user",
+        iamUserName: "dev-user",
+        iamAccessKeyId: "DEVKEY",
+        iamSecretAccessKey: "DEVSECRET",
+        region: region,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 2 * 60 * 60 * 1000,
+        status: "active",
+      };
     }
 
     try {
@@ -116,9 +113,11 @@ export class AWSControlTowerService {
       const errorMessage = error instanceof Error ? error.message : String(error);
 
       // Check for credential issues
-      if (errorMessage?.includes("security token") || errorMessage?.includes("InvalidClientTokenId")) {
+      if (errorMessage?.includes("security token") || errorMessage?.includes("InvalidClientTokenId") || errorMessage?.includes("AccessDenied")) {
         throw new Error(
-          "AWS credentials configured on backend are invalid. Please verify AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables."
+          "AWS IAM role is not configured or lacks required permissions. " +
+          "Please ensure the App Runner service has the 'AppRunner-AWSLabs-InstanceRole' IAM role attached " +
+          "with OrganizationsFullAccess and IAMFullAccess policies."
         );
       }
 

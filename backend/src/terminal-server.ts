@@ -3,65 +3,35 @@ import AWS from "aws-sdk";
 import { PassThrough } from "stream";
 
 export interface AWSCredentials {
-  accessKeyId: string;
-  secretAccessKey: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
   region: string;
 }
 
 export class TerminalInstance {
   private sessionId: string;
-  private credentials: AWSCredentials;
+  private region: string;
   private commandHistory: string[] = [];
   private isExecuting = false;
   private credentialsValidated = false;
 
   constructor(sessionId: string, credentials: AWSCredentials) {
     this.sessionId = sessionId;
-    this.credentials = credentials;
-  }
-
-  /**
-   * Check if credentials are temporary/mock credentials (created at lab start)
-   */
-  private isTemporaryCredential(): boolean {
-    // Temporary credentials created by AWSControlTowerService for labs
-    return (
-      this.credentials.accessKeyId === "DEVKEY" ||
-      this.credentials.accessKeyId?.startsWith("AKIA") === false // Real AWS keys start with AKIA
-    );
+    this.region = credentials.region || process.env.AWS_REGION || 'us-east-1';
   }
 
   /**
    * Validate AWS credentials by calling sts:GetCallerIdentity
-   * Skip validation for temporary/mock credentials from lab sandbox creation
+   * Uses default credential chain (IAM role in App Runner)
    */
   private async validateCredentials(): Promise<{ valid: boolean; error?: string }> {
-    // Skip validation for temporary credentials created at lab start
-    if (this.isTemporaryCredential()) {
-      console.log(
-        `[Terminal:${this.sessionId}] ✓ Using temporary lab credentials (validation skipped)`
-      );
-      return { valid: true };
-    }
-
     try {
       const sts = new AWS.STS({
-        accessKeyId: this.credentials.accessKeyId,
-        secretAccessKey: this.credentials.secretAccessKey,
-        region: this.credentials.region,
+        region: this.region,
       });
 
-      // Log masked credentials for debugging
-      const maskedKey = this.credentials.accessKeyId
-        ? this.credentials.accessKeyId.substring(0, 4) +
-          "*".repeat(this.credentials.accessKeyId.length - 8) +
-          this.credentials.accessKeyId.substring(
-            this.credentials.accessKeyId.length - 4
-          )
-        : "undefined";
-
       console.log(
-        `[Terminal:${this.sessionId}] Validating AWS credentials... (Key: ${maskedKey}, Region: ${this.credentials.region})`
+        `[Terminal:${this.sessionId}] Validating AWS credentials from IAM role... (Region: ${this.region})`
       );
 
       // Validate credentials by calling get-caller-identity
@@ -122,26 +92,19 @@ export class TerminalInstance {
       this.commandHistory.push(command);
 
       try {
-        // Environment setup with AWS credentials
+        // Environment setup using IAM role (no explicit credentials)
         const env = {
           ...process.env,
-          AWS_ACCESS_KEY_ID: this.credentials.accessKeyId,
-          AWS_SECRET_ACCESS_KEY: this.credentials.secretAccessKey,
-          AWS_DEFAULT_REGION: this.credentials.region,
-          AWS_REGION: this.credentials.region,
+          AWS_DEFAULT_REGION: this.region,
+          AWS_REGION: this.region,
         };
-        // to prevent interference from parent process credentials
 
         // Parse command
         const [cmd, ...args] = command.trim().split(/\s+/);
 
         console.log(`[Terminal:${this.sessionId}] Executing: ${command}`);
         console.log(
-          `[Terminal:${this.sessionId}] Environment: Region=${this.credentials.region}, KeyId=${
-            this.credentials.accessKeyId
-              ? this.credentials.accessKeyId.substring(0, 4) + "****"
-              : "undefined"
-          }`
+          `[Terminal:${this.sessionId}] Environment: Region=${this.region}, using IAM role credentials`
         );
 
         // If user invoked the `aws` CLI but the binary is not available in the image,
@@ -169,9 +132,7 @@ export class TerminalInstance {
                 this.credentialsValidated = true;
               }
               const awsCredentials = {
-                accessKeyId: this.credentials.accessKeyId,
-                secretAccessKey: this.credentials.secretAccessKey,
-                region: this.credentials.region,
+                region: this.region,
               };
 
               const service = args[0];
