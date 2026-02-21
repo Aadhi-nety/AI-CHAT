@@ -1,46 +1,57 @@
 # AWS Credentials Fix - TODO
 
 ## Problem
-Error: "The security token included in the request is invalid" when running AWS CLI commands in the terminal.
+Error: "The AWS Access Key Id you provided does not exist in our records." when running AWS CLI commands in the terminal.
 
 ## Root Cause Analysis
-This error typically means:
-1. The AWS access key ID or secret access key is invalid
-2. The credentials have expired
-3. The IAM user was not created properly in AWS
+This error means the AWS access key ID is NOT valid in AWS IAM. The credentials either:
+1. Were never created
+2. Were deleted/deactivated
+3. Belong to a different AWS account
+4. Are malformed
 
 ## Solution Plan
 
-### 1. Add Credential Validation in Terminal Server
-- [ ] Before executing any AWS command, validate credentials using `aws sts get-caller-identity`
-- [ ] Return a clear error message if credentials are invalid
-- [ ] Add logging to see what's happening
+### 1. Fix Credential Validation Logic
+- [ ] Update `isTemporaryCredential()` method to only consider "DEVKEY" as temporary
+- [ ] Remove the faulty logic that treats non-AKIA keys as temporary
+- [ ] Always validate credentials that start with "AKIA"
 
-### 2. Improve IAM User Creation Error Handling
-- [ ] Add better error handling in `aws-control-tower.service.ts`
-- [ ] Log IAM user creation failures with details
-- [ ] Validate access keys after creation
+### 2. Improve Error Handling
+- [ ] Add specific error handling for "Access Key does not exist" errors
+- [ ] Add logging to help debug credential issues
+- [ ] Return more helpful error messages to users
 
-### 3. Add Debug Logging
-- [ ] Log credentials being used (masked) in terminal-server.ts
-- [ ] Log the full command and environment variables (masked)
-- [ ] Add more detailed error messages
-
-### 4. Improve Error Messages
-- [ ] Return helpful error messages when credentials are invalid
-- [ ] Include troubleshooting steps in error messages
-- [ ] Suggest checking IAM user status
+### 3. Test the Fix
+- [ ] Test with invalid credentials to verify proper error handling
+- [ ] Test with valid credentials to ensure normal operation
 
 ## Files to Modify
-1. `backend/src/terminal-server.ts` - Add credential validation
-2. `backend/src/services/aws-control-tower.service.ts` - Improve error handling
+1. `backend/src/terminal-server.ts` - Fix validation logic
 
-## Testing
-- Test with valid AWS credentials
-- Test with invalid credentials to verify error messages
-- Test with expired credentials
+## The Fix
+
+### Current (Buggy) Code:
+```
+typescript
+private isTemporaryCredential(): boolean {
+  return (
+    this.credentials.accessKeyId === "DEVKEY" ||
+    this.credentials.accessKeyId?.startsWith("AKIA") === false
+  );
+}
+```
+
+### Fixed Code:
+```
+typescript
+private isTemporaryCredential(): boolean {
+  // Only consider "DEVKEY" as temporary/mock credential
+  return this.credentials.accessKeyId === "DEVKEY";
+}
+```
 
 ## Notes
-- The error "The security token included in the request is invalid" is different from permission errors
-- This error means the credentials themselves are not valid AWS credentials
-- Need to ensure IAM user creation is working correctly
+- The credentials provided by the user (AKIA3E3WMCQ6QXINYVNY) are NOT valid
+- This is NOT a code bug - the credentials themselves are invalid
+- The code needs to be fixed to properly handle invalid credentials with better error messages

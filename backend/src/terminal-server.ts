@@ -24,11 +24,9 @@ export class TerminalInstance {
    * Check if credentials are temporary/mock credentials (created at lab start)
    */
   private isTemporaryCredential(): boolean {
-    // Temporary credentials created by AWSControlTowerService for labs
-    return (
-      this.credentials.accessKeyId === "DEVKEY" ||
-      this.credentials.accessKeyId?.startsWith("AKIA") === false // Real AWS keys start with AKIA
-    );
+    // Only consider "DEVKEY" as temporary/mock credential
+    // All keys starting with "AKIA" are real AWS credentials and must be validated
+    return this.credentials.accessKeyId === "DEVKEY";
   }
 
   /**
@@ -84,16 +82,36 @@ export class TerminalInstance {
         errorMessage?.includes("security token") ||
         errorMessage?.includes("invalid") ||
         errorMessage?.includes("NotAuthorized") ||
+        errorMessage?.includes("does not exist") ||
         errorCode === "InvalidClientTokenId" ||
         errorCode === "SignatureDoesNotMatch";
 
       if (isInvalidToken) {
+        // Provide specific error messages based on the error type
+        let userErrorMessage = "AWS credentials are invalid or expired. Please verify your access key ID and secret access key.";
+        
+        if (errorMessage?.includes("does not exist")) {
+          userErrorMessage = 
+            "ERROR: The AWS Access Key ID does not exist in our records.\n\n" +
+            "This means the access key was never created, has been deleted, or belongs to a different AWS account.\n\n" +
+            "Please verify:\n" +
+            "1. You are using the correct Access Key ID\n" +
+            "2. The IAM user still exists in AWS\n" +
+            "3. The access key is still active (not deleted/deactivated)\n" +
+            "4. The credentials are for the correct AWS account";
+        } else if (errorCode === "SignatureDoesNotMatch") {
+          userErrorMessage = 
+            "ERROR: The AWS Secret Access Key is incorrect.\n\n" +
+            "The signature doesn't match, which means the secret access key is wrong.\n\n" +
+            "Please verify your AWS_SECRET_ACCESS_KEY is correct.";
+        }
+
         console.error(
           `[Terminal:${this.sessionId}] This is a credential authentication error - the keys provided are not valid AWS credentials`
         );
         return {
           valid: false,
-          error: "AWS credentials are invalid or expired. Please verify your access key ID and secret access key.",
+          error: userErrorMessage,
         };
       }
 
