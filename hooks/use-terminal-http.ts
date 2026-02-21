@@ -225,6 +225,13 @@ export function useTerminalHttp(
         }),
       });
 
+      // Handle credential errors specifically
+      if (result.type === 'credential_error') {
+        const credentialError = new Error(result.message || 'AWS credentials are invalid');
+        credentialError.name = 'CredentialError';
+        throw credentialError;
+      }
+
       if (result.type === 'error') {
         throw new Error(result.message || 'Command execution failed');
       }

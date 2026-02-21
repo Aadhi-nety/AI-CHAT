@@ -59,7 +59,7 @@ router.post('/message', async (req, res) => {
           });
         }
 
-        try {
+          try {
           // Get or create terminal for this session
           let terminal = terminalServer.getTerminal(sessionId);
 
@@ -67,8 +67,21 @@ router.post('/message', async (req, res) => {
             terminal = terminalServer.createTerminal(sessionId, {
               accessKeyId: session.sandboxAccount.iamAccessKeyId,
               secretAccessKey: session.sandboxAccount.iamSecretAccessKey,
+              sessionToken: session.sandboxAccount.iamSessionToken,
               region: session.sandboxAccount.region || 'us-east-1'
             });
+            
+            // Validate credentials immediately upon terminal creation
+            console.log(`[WS API] Validating credentials for session ${sessionId}...`);
+            const validation = await terminal.validateCredentials();
+            if (!validation.valid) {
+              return res.status(403).json({
+                type: 'credential_error',
+                message: validation.error || 'Invalid AWS credentials',
+                sessionId,
+                timestamp: Date.now()
+              });
+            }
           }
 
           // Execute command

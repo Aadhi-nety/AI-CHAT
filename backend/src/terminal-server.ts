@@ -6,6 +6,91 @@ export interface AWSCredentials {
   accessKeyId: string;
   secretAccessKey: string;
   region: string;
+  sessionToken?: string;
+  expiration?: Date;
+}
+
+/**
+ * STS Credential Refresh Manager
+ * Handles automatic refresh of temporary AWS credentials (ASIA keys)
+ */
+export class STSCredentialManager {
+  private roleArn?: string;
+  private roleSessionName?: string;
+  private region: string;
+
+  constructor(roleArn?: string, roleSessionName?: string, region: string = "us-east-1") {
+    this.roleArn = roleArn || process.env.AWS_MANAGEMENT_ACCOUNT_ROLE_ARN;
+    this.roleSessionName = roleSessionName || `lab-session-${Date.now()}`;
+    this.region = region;
+  }
+
+  /**
+   * Check if credentials need refresh
+   * Returns true if credentials are temporary (ASIA) and expired or about to expire
+   */
+  needsRefresh(credentials: AWSCredentials): boolean {
+    // Only ASIA keys are temporary credentials that need refresh
+    if (!credentials.accessKeyId?.startsWith("ASIA")) {
+      return false;
+    }
+
+    // If no expiration, assume needs refresh (safer)
+    if (!credentials.expiration) {
+      return true;
+    }
+
+    // Refresh if expiring within 5 minutes
+    const fiveMinutesFromNow = new Date(Date.now() + 5 * 60 * 1000);
+    return credentials.expiration < fiveMinutesFromNow;
+  }
+
+  /**
+   * Refresh credentials by calling STS AssumeRole
+   */
+  async refreshCredentials(currentCredentials: AWSCredentials): Promise<AWSCredentials> {
+    // If no role ARN is configured, we can't refresh
+    const roleArn = this.roleArn || process.env.AWS_MANAGEMENT_ACCOUNT_ROLE_ARN;
+    if (!roleArn) {
+      console.warn("[STSCredentialManager] No role ARN configured, cannot refresh credentials");
+      return currentCredentials;
+    }
+
+    try {
+      console.log("[STSCredentialManager] Refreshing STS credentials...");
+
+      const sts = new AWS.STS({
+        accessKeyId: currentCredentials.accessKeyId,
+        secretAccessKey: currentCredentials.secretAccessKey,
+        sessionToken: currentCredentials.sessionToken,
+        region: this.region,
+      });
+
+      const result = await sts.assumeRole({
+        RoleArn: roleArn,
+        RoleSessionName: this.roleSessionName || `lab-session-${Date.now()}`,
+        DurationSeconds: 3600, // 1 hour
+      }).promise();
+
+      if (!result.Credentials) {
+        throw new Error("Failed to get credentials from STS AssumeRole");
+      }
+
+      const newCredentials: AWSCredentials = {
+        accessKeyId: result.Credentials.AccessKeyId!,
+        secretAccessKey: result.Credentials.SecretAccessKey!,
+        sessionToken: result.Credentials.SessionToken!,
+        expiration: result.Credentials.Expiration,
+        region: this.region,
+      };
+
+      console.log("[STSCredentialManager] Credentials refreshed successfully");
+      return newCredentials;
+    } catch (error) {
+      console.error("[STSCredentialManager] Failed to refresh credentials:", error);
+      throw error;
+    }
+  }
 }
 
 export class TerminalInstance {
@@ -14,10 +99,16 @@ export class TerminalInstance {
   private commandHistory: string[] = [];
   private isExecuting = false;
   private credentialsValidated = false;
+  private credentialManager: STSCredentialManager;
 
   constructor(sessionId: string, credentials: AWSCredentials) {
     this.sessionId = sessionId;
     this.credentials = credentials;
+    this.credentialManager = new STSCredentialManager(
+      undefined,
+      undefined,
+      credentials.region
+    );
   }
 
   /**
@@ -25,15 +116,84 @@ export class TerminalInstance {
    */
   private isTemporaryCredential(): boolean {
     // Only consider "DEVKEY" as temporary/mock credential
-    // All keys starting with "AKIA" are real AWS credentials and must be validated
+    // All keys starting with "AKIA" or "ASIA" are real AWS credentials
     return this.credentials.accessKeyId === "DEVKEY";
+  }
+
+  /**
+   * Check if credentials are STS temporary credentials (ASIA keys)
+   */
+  private isStsTemporaryCredential(): boolean {
+    return this.credentials.accessKeyId?.startsWith("ASIA");
+  }
+
+  /**
+   * Refresh credentials if they are STS temporary credentials and expired/expiring
+   */
+  private async refreshCredentialsIfNeeded(): Promise<void> {
+    // Only refresh STS temporary credentials
+    if (!this.isStsTemporaryCredential()) {
+      return;
+    }
+
+    // Check if refresh is needed
+    if (!this.credentialManager.needsRefresh(this.credentials)) {
+      return;
+    }
+
+    console.log(`[Terminal:${this.sessionId}] STS credentials expiring soon, refreshing...`);
+
+    try {
+      this.credentials = await this.credentialManager.refreshCredentials(this.credentials);
+      console.log(`[Terminal:${this.sessionId}] STS credentials refreshed successfully`);
+    } catch (error) {
+      console.error(`[Terminal:${this.sessionId}] Failed to refresh STS credentials:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get AWS SDK credentials object with session token
+   */
+  private getAwsSdkCredentials(): AWS.Credentials {
+    const creds: any = {
+      accessKeyId: this.credentials.accessKeyId,
+      secretAccessKey: this.credentials.secretAccessKey,
+    };
+
+    // Include session token if present (for STS temporary credentials)
+    if (this.credentials.sessionToken) {
+      creds.sessionToken = this.credentials.sessionToken;
+    }
+
+    return new AWS.Credentials(creds);
+  }
+
+  /**
+   * Get environment variables for CLI execution with session token
+   */
+  private getCliEnvironment(): { [key: string]: string } {
+    const env: { [key: string]: string } = {
+      ...process.env,
+      AWS_ACCESS_KEY_ID: this.credentials.accessKeyId,
+      AWS_SECRET_ACCESS_KEY: this.credentials.secretAccessKey,
+      AWS_DEFAULT_REGION: this.credentials.region,
+      AWS_REGION: this.credentials.region,
+    };
+
+    // Include session token if present (for STS temporary credentials)
+    if (this.credentials.sessionToken) {
+      env.AWS_SESSION_TOKEN = this.credentials.sessionToken;
+    }
+
+    return env;
   }
 
   /**
    * Validate AWS credentials by calling sts:GetCallerIdentity
    * Skip validation for temporary/mock credentials from lab sandbox creation
    */
-  private async validateCredentials(): Promise<{ valid: boolean; error?: string }> {
+  async validateCredentials(): Promise<{ valid: boolean; error?: string }> {
     // Skip validation for temporary credentials created at lab start
     if (this.isTemporaryCredential()) {
       console.log(
@@ -43,9 +203,11 @@ export class TerminalInstance {
     }
 
     try {
+      // Refresh credentials if needed before validation
+      await this.refreshCredentialsIfNeeded();
+
       const sts = new AWS.STS({
-        accessKeyId: this.credentials.accessKeyId,
-        secretAccessKey: this.credentials.secretAccessKey,
+        credentials: this.getAwsSdkCredentials(),
         region: this.credentials.region,
       });
 
@@ -58,8 +220,9 @@ export class TerminalInstance {
           )
         : "undefined";
 
+      const tokenStatus = this.credentials.sessionToken ? "with session token" : "without session token";
       console.log(
-        `[Terminal:${this.sessionId}] Validating AWS credentials... (Key: ${maskedKey}, Region: ${this.credentials.region})`
+        `[Terminal:${this.sessionId}] Validating AWS credentials... (Key: ${maskedKey}, Region: ${this.credentials.region}, ${tokenStatus})`
       );
 
       // Validate credentials by calling get-caller-identity
@@ -104,6 +267,10 @@ export class TerminalInstance {
             "ERROR: The AWS Secret Access Key is incorrect.\n\n" +
             "The signature doesn't match, which means the secret access key is wrong.\n\n" +
             "Please verify your AWS_SECRET_ACCESS_KEY is correct.";
+        } else if (errorMessage?.includes("ExpiredToken") || errorMessage?.includes("ExpiredTokenException")) {
+          userErrorMessage = 
+            "ERROR: AWS session credentials have expired.\n\n" +
+            "Your temporary session token has expired. Please refresh your credentials or start a new lab session.";
         }
 
         console.error(
@@ -140,15 +307,8 @@ export class TerminalInstance {
       this.commandHistory.push(command);
 
       try {
-        // Environment setup with AWS credentials
-        const env = {
-          ...process.env,
-          AWS_ACCESS_KEY_ID: this.credentials.accessKeyId,
-          AWS_SECRET_ACCESS_KEY: this.credentials.secretAccessKey,
-          AWS_DEFAULT_REGION: this.credentials.region,
-          AWS_REGION: this.credentials.region,
-        };
-        // to prevent interference from parent process credentials
+        // Environment setup with AWS credentials (including session token)
+        const env = this.getCliEnvironment();
 
         // Parse command
         const [cmd, ...args] = command.trim().split(/\s+/);
@@ -159,7 +319,7 @@ export class TerminalInstance {
             this.credentials.accessKeyId
               ? this.credentials.accessKeyId.substring(0, 4) + "****"
               : "undefined"
-          }`
+          }, SessionToken=${this.credentials.sessionToken ? "present" : "none"}`
         );
 
         // If user invoked the `aws` CLI but the binary is not available in the image,
@@ -167,6 +327,9 @@ export class TerminalInstance {
         if (cmd === 'aws') {
           (async () => {
             try {
+              // Refresh credentials if needed before execution
+              await this.refreshCredentialsIfNeeded();
+
               // Validate credentials on first AWS command
               if (!this.credentialsValidated) {
                 const validationResult = await this.validateCredentials();
@@ -186,18 +349,16 @@ export class TerminalInstance {
                 }
                 this.credentialsValidated = true;
               }
-              const awsCredentials = {
-                accessKeyId: this.credentials.accessKeyId,
-                secretAccessKey: this.credentials.secretAccessKey,
-                region: this.credentials.region,
-              };
+
+              // Build AWS credentials object with session token
+              const awsCredentials = this.getAwsSdkCredentials();
 
               const service = args[0];
               const action = args[1];
 
               // Handle SSM commands commonly used by labs
               if (service === 'ssm' && action === 'describe-instance-information') {
-                const ssm = new AWS.SSM(awsCredentials);
+                const ssm = new AWS.SSM({ credentials: awsCredentials, region: this.credentials.region });
                 const res = await ssm.describeInstanceInformation().promise();
                 const output = {
                   command,
@@ -211,7 +372,7 @@ export class TerminalInstance {
               }
 
               if (service === 'ssm' && action === 'describe-sessions') {
-                const ssm = new AWS.SSM(awsCredentials);
+                const ssm = new AWS.SSM({ credentials: awsCredentials, region: this.credentials.region });
 
                 // Simple parser for --filters 'key=target,value=<id>'
                 let filtersArg = args.find(a => a === '--filters');
@@ -245,7 +406,7 @@ export class TerminalInstance {
 
               // STS: get-caller-identity
               if (service === 'sts' && action === 'get-caller-identity') {
-                const sts = new AWS.STS(awsCredentials);
+                const sts = new AWS.STS({ credentials: awsCredentials, region: this.credentials.region });
                 try {
                   const res = await sts.getCallerIdentity().promise();
                   const output = {
@@ -271,7 +432,7 @@ export class TerminalInstance {
 
               // S3: simple `aws s3 ls` and `aws s3 ls s3://bucket`
               if (service === 's3' && action === 'ls') {
-                const s3 = new AWS.S3(awsCredentials);
+                const s3 = new AWS.S3({ credentials: awsCredentials, region: this.credentials.region });
                 // `aws s3 ls` with no further args lists buckets
                 if (args.length === 2) {
                   const res = await s3.listBuckets().promise();
@@ -305,7 +466,7 @@ export class TerminalInstance {
 
               // s3api list-buckets
               if (service === 's3api' && action === 'list-buckets') {
-                const s3 = new AWS.S3(awsCredentials);
+                const s3 = new AWS.S3({ credentials: awsCredentials, region: this.credentials.region });
                 const res = await s3.listBuckets().promise();
                 const output = {
                   command,
@@ -320,7 +481,7 @@ export class TerminalInstance {
 
               // EC2: describe-instances
               if (service === 'ec2' && action === 'describe-instances') {
-                const ec2 = new AWS.EC2(awsCredentials);
+                const ec2 = new AWS.EC2({ credentials: awsCredentials, region: this.credentials.region });
                 try {
                   const res = await ec2.describeInstances().promise();
                   const output = {
@@ -346,7 +507,7 @@ export class TerminalInstance {
 
               // IAM: common queries
               if (service === 'iam') {
-                const iam = new AWS.IAM(awsCredentials);
+                const iam = new AWS.IAM({ credentials: awsCredentials, region: this.credentials.region });
 
                 if (action === 'list-users') {
                   try {
@@ -422,7 +583,7 @@ export class TerminalInstance {
 
               // S3API: bucket policy and public access block helpers
               if (service === 's3api') {
-                const s3 = new AWS.S3(awsCredentials);
+                const s3 = new AWS.S3({ credentials: awsCredentials, region: this.credentials.region });
 
                 if (action === 'get-bucket-policy') {
                   const bucket = args[1] || args.find(a => a.startsWith('--bucket'))?.split('=')[1];
@@ -438,9 +599,7 @@ export class TerminalInstance {
                 }
 
                 if (action === 'put-bucket-policy') {
-                  // simplistic: expect --bucket BUCKET and --policy file://policy.json (we won't read files)
                   const bucket = args.find((a, i) => a === '--bucket') ? args[args.indexOf('--bucket') + 1] : undefined;
-                  // Can't read local files from browser terminal; return helpful message
                   const output = { command, exitCode: 1, stdout: '', stderr: 'put-bucket-policy with local file is not supported in this terminal. Use the SDK or provide policy JSON via API.', timestamp: Date.now() };
                   resolve(JSON.stringify(output, null, 2));
                   return;
@@ -448,9 +607,7 @@ export class TerminalInstance {
 
                 if (action === 'put-public-access-block') {
                   const bucket = args[args.indexOf('--bucket') + 1];
-                  // parse configuration string like --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true
                   const configArg = args.find(a => a.startsWith('--public-access-block-configuration')) || '';
-                  // naive parse
                   const configStr = configArg.includes('=') ? configArg.split('=')[1] : '';
                   const pairs = configStr.split(',').filter(Boolean);
                   const config: any = {};
@@ -497,7 +654,7 @@ export class TerminalInstance {
 
               // Organizations: list-accounts
               if (service === 'organizations' && action === 'list-accounts') {
-                const org = new AWS.Organizations(awsCredentials);
+                const org = new AWS.Organizations({ credentials: awsCredentials, region: this.credentials.region });
                 const res = await org.listAccounts().promise();
                 const output = { command, exitCode: 0, stdout: JSON.stringify(res, null, 2), stderr: '', timestamp: Date.now() };
                 resolve(JSON.stringify(output, null, 2));
@@ -506,7 +663,7 @@ export class TerminalInstance {
 
               // DynamoDB: table operations
               if (service === 'dynamodb') {
-                const dynamodb = new AWS.DynamoDB(awsCredentials);
+                const dynamodb = new AWS.DynamoDB({ credentials: awsCredentials, region: this.credentials.region });
 
                 if (action === 'list-tables') {
                   try {
@@ -559,7 +716,7 @@ export class TerminalInstance {
 
               // Lambda: function operations
               if (service === 'lambda') {
-                const lambda = new AWS.Lambda(awsCredentials);
+                const lambda = new AWS.Lambda({ credentials: awsCredentials, region: this.credentials.region });
 
                 if (action === 'list-functions') {
                   try {
@@ -624,7 +781,7 @@ export class TerminalInstance {
 
               // CloudTrail: audit trail operations
               if (service === 'cloudtrail') {
-                const cloudtrail = new AWS.CloudTrail(awsCredentials);
+                const cloudtrail = new AWS.CloudTrail({ credentials: awsCredentials, region: this.credentials.region });
 
                 if (action === 'lookup-events') {
                   try {
@@ -671,7 +828,7 @@ export class TerminalInstance {
 
               // SSM: additional operations beyond describe-instance-information and describe-sessions
               if (service === 'ssm') {
-                const ssm = new AWS.SSM(awsCredentials);
+                const ssm = new AWS.SSM({ credentials: awsCredentials, region: this.credentials.region });
 
                 if (action === 'list-command-invocations') {
                   try {
@@ -797,6 +954,15 @@ export class TerminalInstance {
 
     const message = error?.message || String(error);
     const code = error?.code || "";
+
+    // Handle expired token errors specifically
+    if (code === "ExpiredToken" || code === "ExpiredTokenException" || message?.includes("ExpiredToken")) {
+      return (
+        "AWS session credentials have expired. " +
+        "Your temporary session token is no longer valid. " +
+        "Please refresh your credentials or start a new lab session."
+      );
+    }
 
     // Map AWS error codes to helpful messages
     if (

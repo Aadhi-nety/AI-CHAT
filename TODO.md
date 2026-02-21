@@ -1,3 +1,41 @@
+# AWS Labs - Implementation TODO
+
+## Overview
+This TODO tracks multiple improvements to the AWS Labs platform including WebSocket fixes and credential handling.
+
+---
+
+# AWS Credentials Fix - COMPLETED ✓
+
+## Problem
+Error: "Invalid AWS Access Key ID: The security token included in the request is invalid" when running AWS CLI commands in the terminal.
+
+## Root Cause
+The terminal was executing AWS commands without first validating that the credentials provided by the lab session are valid.
+
+## Solution Implemented
+
+### Changes Made:
+
+1. **backend/src/terminal-server.ts**
+   - Changed `validateCredentials()` from `private` to `public` method
+   - Already had proper validation logic for "does not exist" errors
+
+2. **backend/src/routes/websocket.routes.ts**
+   - Added immediate credential validation when terminal is created
+   - Returns specific `credential_error` type for frontend handling
+
+3. **hooks/use-terminal-http.ts**
+   - Added handling for `credential_error` response type
+   - Throws named `CredentialError` for better error handling
+
+### Error Messages Now Provided:
+- "The AWS Access Key ID does not exist in our records" - when key is invalid
+- "The AWS Secret Access Key is incorrect" - when signature doesn't match
+- Clear instructions for users on how to resolve
+
+---
+
 # WebSocket 1006 Fix - Implementation TODO
 
 ## Overview

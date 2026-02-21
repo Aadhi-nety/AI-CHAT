@@ -9,6 +9,7 @@ export interface SandboxAccount {
   iamUserName: string;
   iamAccessKeyId: string;
   iamSecretAccessKey: string;
+  iamSessionToken?: string;
   region: string;
   createdAt: number;
   expiresAt: number;
@@ -29,31 +30,113 @@ export class AWSControlTowerService {
   private managementAccountId: string;
   private managementRole: string;
   private region: string;
+  // The Labs account ID where roles can be assumed
+  private readonly LABS_ACCOUNT_ID = "766363046973";
 
   constructor() {
     this.managementAccountId = process.env.AWS_MANAGEMENT_ACCOUNT_ID || "";
     this.managementRole = process.env.AWS_MANAGEMENT_ACCOUNT_ROLE_ARN || "";
-    this.region = process.env.AWS_REGION || "us-east-1";
+    this.region = process.env.AWS_REGION || "ap-south-1";
 
     this.organizations = new AWS.Organizations({ region: this.region });
     this.iam = new AWS.IAM({ region: this.region });
   }
 
   /**
+   * Get credentials by assuming a role in the Labs account
+   * Uses App Runner's instance role to assume the Labs role
+   */
+  private async getLabsCredentials(labId: string, userId: string): Promise<{
+    accessKeyId: string;
+    secretAccessKey: string;
+    sessionToken: string;
+    expiration: Date;
+  }> {
+    const sts = new AWS.STS();
+    
+    // Role name based on lab ID - e.g., Labs-S3-Admin, Labs-Lambda-Admin
+    const roleName = this.getLabRoleName(labId);
+    const roleArn = `arn:aws:iam::${this.LABS_ACCOUNT_ID}:role/${roleName}`;
+    
+    console.log(`[AWSControlTower] Assuming role: ${roleArn}`);
+    
+    try {
+      const response = await sts.assumeRole({
+        RoleArn: roleArn,
+        RoleSessionName: `lab-session-${userId}-${Date.now()}`,
+        DurationSeconds: 3600, // 1 hour
+      }).promise();
+      
+      if (!response.Credentials) {
+        throw new Error("Failed to get temporary credentials from STS");
+      }
+      
+      console.log(`[AWSControlTower] Successfully assumed role: ${roleName}`);
+      
+      return {
+        accessKeyId: response.Credentials.AccessKeyId,
+        secretAccessKey: response.Credentials.SecretAccessKey,
+        sessionToken: response.Credentials.SessionToken,
+        expiration: response.Credentials.Expiration,
+      };
+    } catch (error) {
+      console.error(`[AWSControlTower] Failed to assume role ${roleArn}:`, error);
+      throw new Error(`Failed to assume lab role: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Get the role name for a specific lab
+   */
+  private getLabRoleName(labId: string): string {
+    const roleNames: Record<string, string> = {
+      "lab-1-s3": "Labs-S3-Admin",
+      "lab-2-iam": "Labs-IAM-Admin", 
+      "lab-3-ec2": "Labs-EC2-Admin",
+      "lab-4-lambda": "Labs-Lambda-Admin",
+      "lab-5-dynamodb": "Labs-DynamoDB-Admin",
+      "lab-6-cloudtrail": "Labs-CloudTrail-Admin",
+      "lab-7-ssm": "Labs-SSM-Admin",
+    };
+    
+    return roleNames[labId] || "Labs-ReadOnly";
+  }
+
+  /**
    * Create a new sandbox AWS account
+   * Uses STS AssumeRole to get credentials for the lab
    */
   async createSandboxAccount(userId: string, labId: string, region: string = "ap-south-1"): Promise<SandboxAccount> {
-    // if AWS credentials are missing we either are running in local/dev or the service
-    // hasn't been configured properly.  In production we want to fail fast with a
-    // clear error; for local development we'll return a mock account so that the
-    // rest of the flow can be exercised without calling AWS.
-    if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
-      if (process.env.NODE_ENV === "production") {
-        console.error("[AWSControlTower] AWS credentials are not configured");
-        throw new Error("AWS credentials not configured on backend");
-      } else {
-        console.warn("[AWSControlTower] AWS credentials missing, using mock sandbox (dev mode)");
-        // return a minimal fake account so UI still works
+    // Use default credentials (App Runner instance role)
+    // and assume the appropriate Labs role
+    try {
+      console.log(`[AWSControlTower] Creating sandbox for lab: ${labId}, user: ${userId}`);
+      
+      // Get temporary credentials by assuming the lab role
+      const credentials = await this.getLabsCredentials(labId, userId);
+      
+      const sandbox: SandboxAccount = {
+        accountId: this.LABS_ACCOUNT_ID,
+        accountName: `lab-${labId}-${userId}`,
+        email: "lab@sandbox.local",
+        iamUserId: "lab-role",
+        iamUserName: this.getLabRoleName(labId),
+        iamAccessKeyId: credentials.accessKeyId,
+        iamSecretAccessKey: credentials.secretAccessKey,
+        iamSessionToken: credentials.sessionToken,
+        region: region,
+        createdAt: Date.now(),
+        expiresAt: credentials.expiration.getTime(),
+        status: "active",
+      };
+      
+      console.log(`[AWSControlTower] Sandbox created with assumed role credentials (expires: ${credentials.expiration})`);
+      return sandbox;
+    } catch (error) {
+      console.error("[AWSControlTower] Failed to create sandbox:", error);
+      
+      // If assume role fails, try dev mode
+      if (process.env.NODE_ENV !== "production") {
         return {
           accountId: "000000000000",
           accountName: `lab-${labId}-${userId}-dev`,
@@ -68,61 +151,8 @@ export class AWSControlTowerService {
           status: "active",
         };
       }
-    }
-
-    try {
-      // Generate unique account name
-      const accountName = `lab-${labId}-${userId}-${uuidv4().slice(0, 8)}`;
-      const accountEmail = `lab-${uuidv4().slice(0, 12)}@sandbox.labs.internal`;
-
-      console.log(
-        `[AWSControlTower] Creating account: ${accountName} (${accountEmail})`
-      );
-
-      // In production, use AWS Organizations CreateAccount API
-      // const accountResponse = await this.organizations.createAccount({
-      //   AccountName: accountName,
-      //   Email: accountEmail,
-      // }).promise();
-      // const accountId = accountResponse.CreateAccountStatus?.AccountId!;
-
-      // For demo: generate mock account ID
-      const accountId = Math.random().toString().slice(2, 14);
-
-      // Create IAM user for the lab in the sandbox account
-      console.log(
-        `[AWSControlTower] Creating IAM user for lab-${labId}, user ${userId}`
-      );
-      const iamUser = await this.createLabIAMUser(accountId, userId, labId);
-
-      const sandbox: SandboxAccount = {
-        accountId,
-        accountName,
-        email: accountEmail,
-        iamUserId: iamUser.iamUserId,
-        iamUserName: iamUser.userName,
-        iamAccessKeyId: iamUser.accessKeyId,
-        iamSecretAccessKey: iamUser.secretAccessKey,
-        region: region,
-        createdAt: Date.now(),
-        expiresAt: Date.now() + 2 * 60 * 60 * 1000, // 2 hours
-        status: "active",
-      };
-
-      console.log(`[AWSControlTower] Sandbox account created: ${accountId}`);
-      return sandbox;
-    } catch (error) {
-      console.error("[AWSControlTower] Failed to create sandbox account:", error);
-      const errorMessage = error instanceof Error ? error.message : String(error);
-
-      // Check for credential issues
-      if (errorMessage?.includes("security token") || errorMessage?.includes("InvalidClientTokenId")) {
-        throw new Error(
-          "AWS credentials configured on backend are invalid. Please verify AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables."
-        );
-      }
-
-      throw new Error(`Failed to create sandbox account: ${errorMessage}`);
+      
+      throw new Error(`Failed to create lab session: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
