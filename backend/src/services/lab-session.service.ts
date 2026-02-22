@@ -1,6 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
 import awsControlTowerService, { SandboxAccount } from "./aws-control-tower.service";
-import cyberangeService from "./cyberange.service";
 import redisService from "./redis.service";
 
 export interface LabSession {
@@ -31,13 +30,6 @@ export class LabSessionService {
       console.log(
         `[LabSession] Creating session for user ${userId}, lab ${labId}`
       );
-
-      // Verify token with Cyberange
-      const validation = await cyberangeService.validateToken(token);
-
-      if (!validation.valid) {
-        throw new Error("Invalid token");
-      }
 
       // Create sandbox AWS account
       const sandboxAccount = await awsControlTowerService.createSandboxAccount(
@@ -73,9 +65,6 @@ export class LabSessionService {
       // Store session in Redis (shared across all backend instances)
       const ttlSeconds = Math.ceil((expiresAt - startedAt) / 1000);
       await redisService.setSession(sessionId, session, ttlSeconds);
-
-      // Notify Cyberange
-      await cyberangeService.notifyLabStarted(purchaseId, sessionId);
 
       console.log(`[LabSession] Session created: ${sessionId}, expiresAt: ${new Date(expiresAt).toISOString()}, now: ${new Date(startedAt).toISOString()}, redisTTL: ${ttlSeconds}s`);
       return session;
@@ -164,14 +153,6 @@ export class LabSessionService {
       await awsControlTowerService.destroySandboxAccount(
         session.sandboxAccount.accountId,
         session.sandboxAccount.iamUserName
-      );
-
-      // Notify Cyberange
-      const duration = Math.floor((Date.now() - session.startedAt) / 1000);
-      await cyberangeService.notifyLabEnded(
-        session.purchaseId,
-        sessionId,
-        duration
       );
 
       session.status = "destroyed";

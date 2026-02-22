@@ -14,7 +14,6 @@ export default function LabsPage() {
   const router = useRouter();
   const [startingLab, setStartingLab] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [sessionToken, setSessionToken] = useState<string>("");
   const [userEmail, setUserEmail] = useState<string>("");
 
   // base URL configured via Vercel environment variable
@@ -32,7 +31,6 @@ export default function LabsPage() {
       window.location.href = "/";
       return;
     }
-    setSessionToken(token);
     setUserEmail(email || "");
   }, []);
 
@@ -64,7 +62,6 @@ export default function LabsPage() {
             userId,
             labId,
             purchaseId,
-            token: sessionToken,
           }),
         }
       );

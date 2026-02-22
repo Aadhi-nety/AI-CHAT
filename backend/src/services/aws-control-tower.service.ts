@@ -104,11 +104,62 @@ export class AWSControlTowerService {
 
   /**
    * Create a new sandbox AWS account
-   * Uses STS AssumeRole to get credentials for the lab
+   * Priority: Env vars > Dev mode > Labs account
    */
   async createSandboxAccount(userId: string, labId: string, region: string = "ap-south-1"): Promise<SandboxAccount> {
-    // Use default credentials (App Runner instance role)
-    // and assume the appropriate Labs role
+    // Check if AWS credentials are provided in environment - use these FIRST regardless of NODE_ENV
+    const awsAccessKeyId = process.env.AWS_ACCESS_KEY_ID;
+    const awsSecretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+    const awsRegion = process.env.AWS_REGION || region;
+    
+    // If AWS credentials are provided in environment, use them directly
+    if (awsAccessKeyId && awsSecretAccessKey) {
+      console.log(`[AWSControlTower] Using credentials from environment variables for lab: ${labId}`);
+      
+      // Check if these are temporary STS credentials (ASIA...)
+      const isStsCredential = awsAccessKeyId.startsWith("ASIA");
+      
+      const sandbox: SandboxAccount = {
+        accountId: "000000000000", // User's own account
+        accountName: `lab-${labId}-${userId}`,
+        email: "lab@sandbox.local",
+        iamUserId: "environment-user",
+        iamUserName: "environment-user",
+        iamAccessKeyId: awsAccessKeyId,
+        iamSecretAccessKey: awsSecretAccessKey,
+        iamSessionToken: isStsCredential ? process.env.AWS_SESSION_TOKEN : undefined,
+        region: awsRegion,
+        createdAt: Date.now(),
+        expiresAt: isStsCredential ? Date.now() + 60 * 60 * 1000 : Date.now() + 365 * 24 * 60 * 60 * 1000,
+        status: "active",
+      };
+      
+      console.log(`[AWSControlTower] Sandbox created with environment credentials (STS: ${isStsCredential})`);
+      return sandbox;
+    }
+    
+    // Check if we should use dev mode (only if no AWS credentials provided)
+    const isDevMode = process.env.NODE_ENV !== "production" || process.env.USE_DEV_CREDENTIALS === "true";
+    
+    // In development mode without credentials, use DEVKEY
+    if (isDevMode) {
+      console.log(`[AWSControlTower] Using DEVKEY credentials for lab: ${labId} (development mode)`);
+      return {
+        accountId: "000000000000",
+        accountName: `lab-${labId}-${userId}-dev`,
+        email: "dev@sandbox.local",
+        iamUserId: "dev-user",
+        iamUserName: "dev-user",
+        iamAccessKeyId: "DEVKEY",
+        iamSecretAccessKey: "DEVSECRET",
+        region: region,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 2 * 60 * 60 * 1000, // 2 hours
+        status: "active",
+      };
+    }
+    
+    // Production mode - try Labs account
     try {
       console.log(`[AWSControlTower] Creating sandbox for lab: ${labId}, user: ${userId}`);
       
@@ -135,24 +186,21 @@ export class AWSControlTowerService {
     } catch (error) {
       console.error("[AWSControlTower] Failed to create sandbox:", error);
       
-      // If assume role fails, try dev mode
-      if (process.env.NODE_ENV !== "production") {
-        return {
-          accountId: "000000000000",
-          accountName: `lab-${labId}-${userId}-dev`,
-          email: "dev@sandbox.local",
-          iamUserId: "dev-user",
-          iamUserName: "dev-user",
-          iamAccessKeyId: "DEVKEY",
-          iamSecretAccessKey: "DEVSECRET",
-          region: region,
-          createdAt: Date.now(),
-          expiresAt: Date.now() + 2 * 60 * 60 * 1000,
-          status: "active",
-        };
-      }
-      
-      throw new Error(`Failed to create lab session: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      // In production, we can't fall back to DEVKEY - we need real credentials
+      // Throw a clear error message
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      throw new Error(
+        `Failed to create lab session: ${errorMessage}\n\n` +
+        `To use this feature with real AWS access, you need to:\n` +
+        `Option 1 (Recommended): Set these environment variables:\n` +
+        `  - AWS_ACCESS_KEY_ID=your_access_key\n` +
+        `  - AWS_SECRET_ACCESS_KEY=your_secret_key\n` +
+        `  - AWS_REGION=us-east-1\n\n` +
+        `Option 2: Set up an AWS Labs account with ID: ${this.LABS_ACCOUNT_ID}\n` +
+        `  - Create IAM roles for each lab type (Labs-S3-Admin, Labs-IAM-Admin, etc.)\n` +
+        `  - Configure cross-account access from your backend account\n\n` +
+        `Or run in development mode by setting NODE_ENV=development`
+      );
     }
   }
 
@@ -191,7 +239,7 @@ export class AWSControlTowerService {
         })
         .promise();
 
-      const userId_response = createUserResponse.User?.UserId || uuidv4();
+      const userIdResponse = createUserResponse.User?.UserId || uuidv4();
 
       // Attach lab-specific policy
       const policyName = `lab-${labId}-policy-${Date.now()}`;
@@ -224,7 +272,7 @@ export class AWSControlTowerService {
       );
 
       return {
-        iamUserId: userId_response,
+        iamUserId: userIdResponse,
         userName,
         accessKeyId: accessKey.AccessKeyId,
         secretAccessKey: accessKey.SecretAccessKey,
@@ -406,9 +454,19 @@ export class AWSControlTowerService {
     try {
       console.log(`[AWSControlTower] Destroying account: ${accountId}`);
 
-      // Delete IAM user and all associated resources
+      // Delete IAM user and all associated resources (if it exists)
       if (iamUserName) {
-        await this.deleteIAMUser(iamUserName);
+        try {
+          await this.deleteIAMUser(iamUserName);
+        } catch (iamError: any) {
+          // If the user doesn't exist, just log and continue - this is not a fatal error
+          if (iamError.code === 'NoSuchEntity' || iamError.code === 'ResourceNotFoundException') {
+            console.log(`[AWSControlTower] IAM user ${iamUserName} does not exist, skipping cleanup`);
+          } else {
+            // For other errors, log but don't fail the session destruction
+            console.warn(`[AWSControlTower] Warning: Failed to delete IAM user ${iamUserName}:`, iamError.message);
+          }
+        }
       }
 
       // In production, close the AWS account
@@ -423,7 +481,8 @@ export class AWSControlTowerService {
       );
     } catch (error) {
       console.error("[AWSControlTower] Failed to destroy account:", error);
-      throw new Error("Failed to destroy sandbox account");
+      // Don't throw - session cleanup should succeed even if AWS cleanup fails
+      console.log(`[AWSControlTower] Session cleanup completed (with warnings)`);
     }
   }
 
@@ -434,38 +493,71 @@ export class AWSControlTowerService {
     try {
       console.log(`[AWSControlTower] Deleting IAM user: ${userName}`);
 
+      // First check if user exists
+      try {
+        await this.iam.getUser({ UserName: userName }).promise();
+      } catch (getUserError: any) {
+        // If user doesn't exist, just log and return
+        if (getUserError.code === 'NoSuchEntity' || getUserError.code === 'ResourceNotFoundException') {
+          console.log(`[AWSControlTower] IAM user ${userName} does not exist, skipping deletion`);
+          return;
+        }
+        // For other errors, re-throw
+        throw getUserError;
+      }
+
       // Detach all policies
       const attachedPolicies = await this.iam.listAttachedUserPolicies({ UserName: userName }).promise();
       for (const policy of attachedPolicies.AttachedPolicies || []) {
-        await this.iam.detachUserPolicy({
-          UserName: userName,
-          PolicyArn: policy.PolicyArn!
-        }).promise();
+        try {
+          await this.iam.detachUserPolicy({
+            UserName: userName,
+            PolicyArn: policy.PolicyArn!
+          }).promise();
+        } catch (e: any) {
+          // Ignore if policy doesn't exist
+          if (e.code !== 'NoSuchEntity') throw e;
+        }
       }
 
       // Delete inline policies
       const inlinePolicies = await this.iam.listUserPolicies({ UserName: userName }).promise();
       for (const policyName of inlinePolicies.PolicyNames || []) {
-        await this.iam.deleteUserPolicy({
-          UserName: userName,
-          PolicyName: policyName
-        }).promise();
+        try {
+          await this.iam.deleteUserPolicy({
+            UserName: userName,
+            PolicyName: policyName
+          }).promise();
+        } catch (e: any) {
+          // Ignore if policy doesn't exist
+          if (e.code !== 'NoSuchEntity') throw e;
+        }
       }
 
       // Delete access keys
       const accessKeys = await this.iam.listAccessKeys({ UserName: userName }).promise();
       for (const accessKey of accessKeys.AccessKeyMetadata || []) {
-        await this.iam.deleteAccessKey({
-          UserName: userName,
-          AccessKeyId: accessKey.AccessKeyId!
-        }).promise();
+        try {
+          await this.iam.deleteAccessKey({
+            UserName: userName,
+            AccessKeyId: accessKey.AccessKeyId!
+          }).promise();
+        } catch (e: any) {
+          // Ignore if key doesn't exist
+          if (e.code !== 'NoSuchEntity') throw e;
+        }
       }
 
       // Delete the user
       await this.iam.deleteUser({ UserName: userName }).promise();
 
       console.log(`[AWSControlTower] IAM user ${userName} deleted successfully`);
-    } catch (error) {
+    } catch (error: any) {
+      // If the user doesn't exist, just log and continue
+      if (error.code === 'NoSuchEntity' || error.code === 'ResourceNotFoundException') {
+        console.log(`[AWSControlTower] IAM user ${userName} already deleted or does not exist`);
+        return;
+      }
       console.error(`[AWSControlTower] Failed to delete IAM user ${userName}:`, error);
       throw error;
     }

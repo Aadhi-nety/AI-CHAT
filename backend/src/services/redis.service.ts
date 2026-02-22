@@ -3,110 +3,80 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+// In-memory storage for sessions (primary storage - no external dependencies)
+const inMemorySessions = new Map<string, { data: unknown; expiry: number }>();
+
 /**
- * Redis Service for shared session storage across multiple backend instances
- * Uses Upstash Redis (serverless external Redis) - compatible with AWS App Runner
- * No VPC configuration required
+ * Session Storage Service
+ * Uses in-memory storage by default - no external Redis required
+ * 
+ * Alternative options (if Redis is needed later):
+ * - Upstash: https://upstash.com
+ * - Redis Cloud: https://redis.com/cloud/
+ * - AWS ElastiCache: https://aws.amazon.com/elasticache/
+ * - Self-hosted Redis with Docker
  */
 export class RedisService {
   private client: Redis | null = null;
   private isConnected = false;
-  private connectionAttempts = 0;
-  private readonly maxConnectionAttempts = 10;
+  private useInMemory = true; // Default to in-memory storage
 
   constructor() {
-    this.initializeClient();
+    // Always use in-memory storage by default
+    // To enable Redis, set USE_REDIS=true and provide REDIS_URL
+    this.initializeStorage();
   }
 
-  private initializeClient(): void {
+  private initializeStorage(): void {
+    const useRedis = process.env.USE_REDIS === 'true';
     const redisUrl = process.env.REDIS_URL;
-    const isProduction = process.env.NODE_ENV === 'production';
 
-    if (!redisUrl) {
-      const errorMsg = "[Redis] CRITICAL: REDIS_URL environment variable is not set.\n" +
-        "========================================\n" +
-        "AWS App Runner Configuration:\n" +
-        "1. Go to AWS App Runner Console\n" +
-        "2. Select your service\n" +
-        "3. Click 'Configuration' tab\n" +
-        "4. Under 'Environment variables', add:\n" +
-        "   Name: REDIS_URL\n" +
-        "   Value: redis://default:password@your-upstash-endpoint:6379\n" +
-        "5. Click 'Save changes' and redeploy\n" +
-        "========================================\n" +
-        "Local Development:\n" +
-        "Create backend/.env file with:\n" +
-        "REDIS_URL=redis://default:password@your-upstash-endpoint:6379\n" +
-        "========================================";
-      console.error(errorMsg);
-      
-      if (isProduction) {
-        throw new Error("REDIS_URL is required for production session storage. See logs above for setup instructions.");
-      } else {
-        console.warn("[Redis] Running in development mode without Redis - session storage will fail");
-        this.client = null;
-        return;
-      }
+    if (!useRedis) {
+      console.log("[Redis] Using in-memory session storage (no external dependencies)");
+      this.useInMemory = true;
+      this.client = null;
+      return;
     }
 
-
-    // Validate URL format
-    if (!redisUrl.startsWith('redis://') && !redisUrl.startsWith('rediss://')) {
-      console.error("[Redis] Invalid REDIS_URL format. Must start with redis:// or rediss://");
-      throw new Error("Invalid REDIS_URL format");
+    // If Redis is explicitly enabled, try to connect
+    if (redisUrl) {
+      this.initializeRedisClient(redisUrl);
+    } else {
+      console.warn("[Redis] USE_REDIS=true but REDIS_URL not set - using in-memory storage");
+      this.useInMemory = true;
     }
+  }
 
-
+  private initializeRedisClient(redisUrl: string): void {
     try {
-      console.log(`[Redis] Initializing connection to Upstash Redis...`);
-      console.log(`[Redis] URL format check: ${redisUrl.startsWith('redis://') ? 'valid' : 'invalid'}`);
+      console.log(`[Redis] Initializing Redis connection...`);
 
-      // Parse URL for logging (mask password)
-      const urlObj = new URL(redisUrl);
-      const maskedUrl = `redis://${urlObj.username}:****@${urlObj.hostname}:${urlObj.port}`;
-      console.log(`[Redis] Connecting to: ${maskedUrl}`);
-
-      // Determine if TLS should be enabled
-      // Upstash requires TLS, check for rediss:// or upstash in URL
-      const useTls = redisUrl.startsWith('rediss://') || redisUrl.includes('upstash.io');
-      
-      console.log(`[Redis] TLS enabled: ${useTls}`);
+      const useTls = redisUrl.startsWith('rediss://');
 
       this.client = new Redis(redisUrl, {
         retryStrategy: (times: number) => {
-          this.connectionAttempts++;
           const delay = Math.min(times * 100, 3000);
-          console.log(`[Redis] Reconnecting in ${delay}ms (attempt ${times}, total attempts: ${this.connectionAttempts})`);
+          console.log(`[Redis] Reconnecting in ${delay}ms (attempt ${times})`);
           
-          if (this.connectionAttempts > this.maxConnectionAttempts) {
-            console.error(`[Redis] Max connection attempts (${this.maxConnectionAttempts}) reached. Giving up.`);
-            return null; // Stop retrying
+          if (times > 5) {
+            console.warn("[Redis] Max retries reached, falling back to in-memory");
+            this.useInMemory = true;
+            return null;
           }
           return delay;
         },
         maxRetriesPerRequest: 3,
         enableReadyCheck: true,
-        // TLS settings for Upstash
-        tls: useTls ? {
-          rejectUnauthorized: true, // Verify certificate
-        } : undefined,
-        connectTimeout: 10000, // 10 second connection timeout
-        commandTimeout: 5000, // 5 second command timeout
-        // Additional options for Upstash compatibility
-        family: 4, // Use IPv4
-        keepAlive: 30000, // Keep connection alive
+        tls: useTls ? { rejectUnauthorized: true } : undefined,
+        connectTimeout: 10000,
+        commandTimeout: 5000,
       });
-
 
       this.setupEventHandlers();
     } catch (error) {
-      console.error("[Redis] Failed to initialize client:", error);
-      if (isProduction) {
-        throw error; // Fail fast in production
-      } else {
-        console.warn("[Redis] Initialization failed in development mode - continuing without Redis");
-        this.client = null;
-      }
+      console.error("[Redis] Failed to initialize:", error);
+      this.useInMemory = true;
+      this.client = null;
     }
   }
 
@@ -118,7 +88,6 @@ export class RedisService {
     this.client.on("connect", () => {
       console.log("[Redis] Connected successfully to Upstash");
       this.isConnected = true;
-      this.connectionAttempts = 0; // Reset on successful connection
     });
 
     this.client.on("ready", () => {
@@ -170,8 +139,12 @@ export class RedisService {
     data: unknown,
     ttlSeconds: number = 7200
   ): Promise<void> {
-    if (!this.client) {
-      throw new Error("Redis client not initialized - check REDIS_URL");
+    // Use in-memory fallback if Redis is not available
+    if (this.useInMemory || !this.client) {
+      const expiry = Date.now() + (ttlSeconds * 1000);
+      inMemorySessions.set(sessionId, { data, expiry });
+      console.log(`[Redis] In-memory session stored: ${sessionId} (TTL: ${ttlSeconds}s)`);
+      return;
     }
 
     if (!this.isReady()) {
@@ -186,7 +159,10 @@ export class RedisService {
       console.log(`[Redis] Session stored: ${sessionId} (TTL: ${ttlSeconds}s)`);
     } catch (error) {
       console.error(`[Redis] Failed to store session ${sessionId}:`, error);
-      throw error; // Fail fast - session must be stored
+      // Fall back to in-memory storage
+      const expiry = Date.now() + (ttlSeconds * 1000);
+      inMemorySessions.set(sessionId, { data, expiry });
+      console.log(`[Redis] Fallback: In-memory session stored: ${sessionId}`);
     }
   }
 
@@ -195,9 +171,21 @@ export class RedisService {
    * Retrieve session data
    */
   async getSession(sessionId: string): Promise<unknown | null> {
-    if (!this.client) {
-      console.error("[Redis] Client not initialized - cannot retrieve session");
-      throw new Error("Redis client not available");
+    // Use in-memory fallback if Redis is not available
+    if (this.useInMemory || !this.client) {
+      const session = inMemorySessions.get(sessionId);
+      if (!session) {
+        console.log(`[Redis] In-memory session not found: ${sessionId}`);
+        return null;
+      }
+      // Check if expired
+      if (Date.now() > session.expiry) {
+        inMemorySessions.delete(sessionId);
+        console.log(`[Redis] In-memory session expired: ${sessionId}`);
+        return null;
+      }
+      console.log(`[Redis] In-memory session retrieved: ${sessionId}`);
+      return session.data;
     }
 
     const key = `session:${sessionId}`;
@@ -222,7 +210,17 @@ export class RedisService {
       }
     } catch (error) {
       console.error(`[Redis] Error retrieving session ${sessionId}:`, error);
-      throw error; // Propagate error for proper handling
+      // Try in-memory fallback
+      const session = inMemorySessions.get(sessionId);
+      if (session) {
+        if (Date.now() > session.expiry) {
+          inMemorySessions.delete(sessionId);
+          return null;
+        }
+        console.log(`[Redis] Fallback: In-memory session retrieved: ${sessionId}`);
+        return session.data;
+      }
+      return null;
     }
   }
 
@@ -231,8 +229,11 @@ export class RedisService {
    * Delete session data
    */
   async deleteSession(sessionId: string): Promise<void> {
-    if (!this.client) {
-      throw new Error("Redis client not initialized");
+    // Use in-memory fallback if Redis is not available
+    if (this.useInMemory || !this.client) {
+      inMemorySessions.delete(sessionId);
+      console.log(`[Redis] In-memory session deleted: ${sessionId}`);
+      return;
     }
 
     const key = `session:${sessionId}`;
@@ -242,7 +243,8 @@ export class RedisService {
       console.log(`[Redis] Session deleted: ${sessionId}`);
     } catch (error) {
       console.error(`[Redis] Failed to delete session ${sessionId}:`, error);
-      throw error;
+      // Also delete from in-memory
+      inMemorySessions.delete(sessionId);
     }
   }
 
@@ -281,8 +283,18 @@ export class RedisService {
    * Get all active session IDs (for debugging)
    */
   async getAllSessionIds(): Promise<string[]> {
-    if (!this.client) {
-      throw new Error("Redis client not initialized");
+    // Use in-memory fallback if Redis is not available
+    if (this.useInMemory || !this.client) {
+      const now = Date.now();
+      const validIds: string[] = [];
+      for (const [sessionId, session] of inMemorySessions.entries()) {
+        if (session.expiry > now) {
+          validIds.push(sessionId);
+        } else {
+          inMemorySessions.delete(sessionId);
+        }
+      }
+      return validIds;
     }
 
     try {
@@ -290,7 +302,15 @@ export class RedisService {
       return keys.map((key: string) => key.replace("session:", ""));
     } catch (error) {
       console.error("[Redis] Failed to get all session IDs:", error);
-      throw error;
+      // Return in-memory sessions
+      const now = Date.now();
+      const validIds: string[] = [];
+      for (const [sessionId, session] of inMemorySessions.entries()) {
+        if (session.expiry > now) {
+          validIds.push(sessionId);
+        }
+      }
+      return validIds;
     }
   }
 

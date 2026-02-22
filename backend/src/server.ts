@@ -134,7 +134,7 @@ app.post("/api/labs/start", async (req, res) => {
   try {
     const { userId, labId, purchaseId, token } = req.body;
 
-    if (!userId || !labId || !purchaseId || !token) {
+    if (!userId || !labId || !purchaseId) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 

@@ -49,6 +49,7 @@ export function useTerminalHttp(
   const commandQueueRef = useRef<TerminalCommand[]>([]);
   const lastStatusRef = useRef<any>(null);
   const isPollingRef = useRef(false);
+  const isCommandExecutingRef = useRef(false);
   
   // Poll interval - check for updates every 1 second
   const POLL_INTERVAL = 1000;
