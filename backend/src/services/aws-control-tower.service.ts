@@ -36,7 +36,11 @@ export class AWSControlTowerService {
   constructor() {
     this.managementAccountId = process.env.AWS_MANAGEMENT_ACCOUNT_ID || "";
     this.managementRole = process.env.AWS_MANAGEMENT_ACCOUNT_ROLE_ARN || "";
-    this.region = process.env.AWS_REGION || "ap-south-1";
+    // Default to us-east-1 for cross-account role assumption (most common)
+    // This can be overridden by AWS_REGION env var
+    this.region = process.env.AWS_REGION || "us-east-1";
+
+    console.log(`[AWSControlTower] Initialized with region: ${this.region}, NODE_ENV: ${process.env.NODE_ENV}`);
 
     this.organizations = new AWS.Organizations({ region: this.region });
     this.iam = new AWS.IAM({ region: this.region });
@@ -104,13 +108,15 @@ export class AWSControlTowerService {
 
   /**
    * Create a new sandbox AWS account
-   * Priority: Env vars > Dev mode > Labs account
+   * Priority: Env vars > AWS SDK default credentials > Labs account > Dev mode (only in development)
    */
   async createSandboxAccount(userId: string, labId: string, region: string = "ap-south-1"): Promise<SandboxAccount> {
-    // Check if AWS credentials are provided in environment - use these FIRST regardless of NODE_ENV
+    // Check if AWS credentials are provided in environment - use these FIRST
     const awsAccessKeyId = process.env.AWS_ACCESS_KEY_ID;
     const awsSecretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
     const awsRegion = process.env.AWS_REGION || region;
+    
+    console.log(`[AWSControlTower] createSandboxAccount called - NODE_ENV: ${process.env.NODE_ENV}, hasAWSEnvCreds: ${!!(awsAccessKeyId && awsSecretAccessKey)}, AWS_ACCESS_KEY_ID: ${awsAccessKeyId ? awsAccessKeyId.substring(0, 4) + '****' : 'undefined'}`);
     
     // If AWS credentials are provided in environment, use them directly
     if (awsAccessKeyId && awsSecretAccessKey) {
@@ -138,32 +144,96 @@ export class AWSControlTowerService {
       return sandbox;
     }
     
-    // Check if we should use dev mode (only if no AWS credentials provided)
-    const isDevMode = process.env.NODE_ENV !== "production" || process.env.USE_DEV_CREDENTIALS === "true";
+    // Check if we're in production mode (not development)
+    const isProduction = process.env.NODE_ENV === "production";
     
-    // In development mode without credentials, use DEVKEY
-    if (isDevMode) {
-      console.log(`[AWSControlTower] Using DEVKEY credentials for lab: ${labId} (development mode)`);
-      return {
-        accountId: "000000000000",
-        accountName: `lab-${labId}-${userId}-dev`,
-        email: "dev@sandbox.local",
-        iamUserId: "dev-user",
-        iamUserName: "dev-user",
-        iamAccessKeyId: "DEVKEY",
-        iamSecretAccessKey: "DEVSECRET",
-        region: region,
-        createdAt: Date.now(),
-        expiresAt: Date.now() + 2 * 60 * 60 * 1000, // 2 hours
-        status: "active",
-      };
+    // In production mode without env credentials, try to get credentials from AWS SDK default chain
+    if (isProduction) {
+      try {
+        console.log(`[AWSControlTower] Production mode: Trying to get credentials from AWS SDK default chain`);
+        
+        // Try to get credentials from AWS SDK default chain (instance role, EC2 metadata, etc.)
+        const sts = new AWS.STS({ region: this.region });
+        const identity = await sts.getCallerIdentity().promise();
+        
+        console.log(`[AWSControlTower] Got credentials from AWS SDK. Account: ${identity.Account}, UserId: ${identity.UserId}`);
+        
+        // Get temporary credentials using GetSessionToken for the current identity
+        const credentials = await sts.getSessionToken({
+          DurationSeconds: 3600,
+        }).promise();
+        
+        if (!credentials.Credentials) {
+          throw new Error("Failed to get session token");
+        }
+        
+        const sandbox: SandboxAccount = {
+          accountId: identity.Account || "unknown",
+          accountName: `lab-${labId}-${userId}`,
+          email: "lab@sandbox.local",
+          iamUserId: identity.UserId || "unknown",
+          iamUserName: identity.Arn?.split('/').pop() || "unknown",
+          iamAccessKeyId: credentials.Credentials.AccessKeyId,
+          iamSecretAccessKey: credentials.Credentials.SecretAccessKey,
+          iamSessionToken: credentials.Credentials.SessionToken,
+          region: awsRegion,
+          createdAt: Date.now(),
+          expiresAt: credentials.Credentials.Expiration.getTime(),
+          status: "active",
+        };
+        
+        console.log(`[AWSControlTower] Sandbox created with SDK default credentials (expires: ${credentials.Credentials.Expiration})`);
+        return sandbox;
+      } catch (sdkError) {
+        console.error("[AWSControlTower] Failed to get credentials from SDK default chain:", sdkError);
+        
+        // Try Labs account as fallback
+        try {
+          console.log(`[AWSControlTower] Trying Labs account as fallback`);
+          const credentials = await this.getLabsCredentials(labId, userId);
+          
+          const sandbox: SandboxAccount = {
+            accountId: this.LABS_ACCOUNT_ID,
+            accountName: `lab-${labId}-${userId}`,
+            email: "lab@sandbox.local",
+            iamUserId: "lab-role",
+            iamUserName: this.getLabRoleName(labId),
+            iamAccessKeyId: credentials.accessKeyId,
+            iamSecretAccessKey: credentials.secretAccessKey,
+            iamSessionToken: credentials.sessionToken,
+            region: region,
+            createdAt: Date.now(),
+            expiresAt: credentials.expiration.getTime(),
+            status: "active",
+          };
+          
+          console.log(`[AWSControlTower] Sandbox created with assumed role credentials (expires: ${credentials.expiration})`);
+          return sandbox;
+        } catch (labsError) {
+          console.error("[AWSControlTower] Failed to create sandbox with Labs account:", labsError);
+          
+          // In production, throw error - can't use mock credentials
+          const errorMessage = labsError instanceof Error ? labsError.message : 'Unknown error';
+          throw new Error(
+            `Failed to create lab session: ${errorMessage}\n\n` +
+            `To use this feature with real AWS access, you need to:\n` +
+            `Option 1 (Recommended): Set these environment variables:\n` +
+            `  - AWS_ACCESS_KEY_ID=your_access_key\n` +
+            `  - AWS_SECRET_ACCESS_KEY=your_secret_key\n` +
+            `  - AWS_REGION=us-east-1\n\n` +
+            `Option 2: Set up an AWS Labs account with ID: ${this.LABS_ACCOUNT_ID}\n` +
+            `  - Create IAM roles for each lab type (Labs-S3-Admin, Labs-IAM-Admin, etc.)\n` +
+            `  - Configure cross-account access from your backend account`
+          );
+        }
+      }
     }
     
-    // Production mode - try Labs account
+    // Development mode - try Labs account first, fall back to DEVKEY if that fails
     try {
-      console.log(`[AWSControlTower] Creating sandbox for lab: ${labId}, user: ${userId}`);
+      console.log(`[AWSControlTower] Development mode: Creating sandbox for lab: ${labId}, user: ${userId}`);
       
-      // Get temporary credentials by assuming the lab role
+      // Try to get Labs credentials first
       const credentials = await this.getLabsCredentials(labId, userId);
       
       const sandbox: SandboxAccount = {
@@ -184,23 +254,22 @@ export class AWSControlTowerService {
       console.log(`[AWSControlTower] Sandbox created with assumed role credentials (expires: ${credentials.expiration})`);
       return sandbox;
     } catch (error) {
-      console.error("[AWSControlTower] Failed to create sandbox:", error);
+      // In development mode, fall back to DEVKEY if Labs account fails
+      console.warn(`[AWSControlTower] Failed to get Labs credentials, using DEVKEY (development mode):`, error);
       
-      // In production, we can't fall back to DEVKEY - we need real credentials
-      // Throw a clear error message
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      throw new Error(
-        `Failed to create lab session: ${errorMessage}\n\n` +
-        `To use this feature with real AWS access, you need to:\n` +
-        `Option 1 (Recommended): Set these environment variables:\n` +
-        `  - AWS_ACCESS_KEY_ID=your_access_key\n` +
-        `  - AWS_SECRET_ACCESS_KEY=your_secret_key\n` +
-        `  - AWS_REGION=us-east-1\n\n` +
-        `Option 2: Set up an AWS Labs account with ID: ${this.LABS_ACCOUNT_ID}\n` +
-        `  - Create IAM roles for each lab type (Labs-S3-Admin, Labs-IAM-Admin, etc.)\n` +
-        `  - Configure cross-account access from your backend account\n\n` +
-        `Or run in development mode by setting NODE_ENV=development`
-      );
+      return {
+        accountId: "000000000000",
+        accountName: `lab-${labId}-${userId}-dev`,
+        email: "dev@sandbox.local",
+        iamUserId: "dev-user",
+        iamUserName: "dev-user",
+        iamAccessKeyId: "DEVKEY",
+        iamSecretAccessKey: "DEVSECRET",
+        region: region,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 2 * 60 * 60 * 1000, // 2 hours
+        status: "active",
+      };
     }
   }
 
@@ -293,7 +362,7 @@ export class AWSControlTowerService {
   ): Promise<void> {
     try {
       const sts = new AWS.STS({
-        accessKeyId,
+        accessKeyId,  
         secretAccessKey,
         region: this.region,
       });

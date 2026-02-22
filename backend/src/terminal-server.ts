@@ -1,5 +1,5 @@
 import { spawn } from "child_process";
-import AWS from "aws-sdk";
+import AWS = require("aws-sdk");
 
 export interface AWSCredentials {
   accessKeyId: string;
@@ -323,11 +323,11 @@ export class TerminalInstance {
   async executeCommand(command: string): Promise<string> {
     return new Promise((resolve, reject) => {
       if (this.isExecuting) {
-        console.warn(`[Terminal:${this.sessionId}] Previous command still executing, allowing new      this.isExecuting = true;
-      command`);
+        console.warn(`[Terminal:${this.sessionId}] Previous command still executing, allowing new command`);
       }
 
- this.commandHistory.push(command);
+      this.isExecuting = true;
+      this.commandHistory.push(command);
 
       const safetyTimeout = setTimeout(() => {
         if (this.isExecuting) {
@@ -347,6 +347,8 @@ export class TerminalInstance {
         const action = args[1];
 
         // Check for DEVKEY (development mode)
+        console.log(`[Terminal:${this.sessionId}] Credential check - accessKeyId: ${this.credentials.accessKeyId ? this.credentials.accessKeyId.substring(0, 4) + '****' : 'undefined'}, region: ${this.credentials.region}, hasSessionToken: ${!!this.credentials.sessionToken}`);
+        
         if (this.credentials.accessKeyId === 'DEVKEY') {
           console.log(`[Terminal:${this.sessionId}] Using mock response for development mode`);
           const mockResponse = this.getMockResponse(service, action, args);
